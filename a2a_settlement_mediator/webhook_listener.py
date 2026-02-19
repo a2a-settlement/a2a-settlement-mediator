@@ -13,10 +13,17 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel
 
 from a2a_settlement_mediator.config import settings
 from a2a_settlement_mediator.mediator import mediate
 from a2a_settlement_mediator.schemas import AuditRecord, WebhookPayload
+from a2a_settlement_mediator.settlement_pipeline import get_merkle_tree, settle
+from a2a_settlement_mediator.worm_schemas import (
+    AP2Mandate,
+    NegotiationTranscript,
+    SettlementResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,3 +174,63 @@ def trigger_mediation(escrow_id: str):
     audit = mediate(escrow_id)
     _audit_log.append(audit)
     return audit.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# SEC 17a-4 WORM Settlement Pipeline endpoints
+# ---------------------------------------------------------------------------
+
+_settlement_log: list[SettlementResult] = []
+
+
+class SettlementRequest(BaseModel):
+    """Request body for the settlement endpoint."""
+
+    transcript_hash: str
+    source_service: str = "crewai"
+    session_id: str | None = None
+    mandates: list[dict]
+    escrow_id: str | None = None
+
+
+@app.post("/settle")
+def trigger_settlement(req: SettlementRequest):
+    """Run the SEC 17a-4 WORM-compliant settlement pipeline.
+
+    Accepts a hashed negotiation transcript and AP2 mandates,
+    runs arbitration, timestamping, and Merkle Tree append.
+    Returns the full cryptographic proof on success, or the
+    failure stage and error on hard-fail.
+    """
+    transcript = NegotiationTranscript(
+        transcript_hash=req.transcript_hash,
+        source_service=req.source_service,
+        session_id=req.session_id,
+    )
+
+    mandates = [AP2Mandate(**m) for m in req.mandates]
+
+    result = settle(transcript, mandates, escrow_id=req.escrow_id)
+    _settlement_log.append(result)
+
+    return result.model_dump(mode="json")
+
+
+@app.get("/settlements")
+def list_settlements(limit: int = 20, offset: int = 0):
+    """List recent settlement results."""
+    records = _settlement_log[offset : offset + limit]
+    return {
+        "settlements": [r.model_dump(mode="json") for r in records],
+        "total": len(_settlement_log),
+    }
+
+
+@app.get("/merkle")
+def merkle_status():
+    """Return current Merkle Tree state."""
+    tree = get_merkle_tree()
+    return {
+        "tree_size": tree.size,
+        "root_hash": tree.root_hash.hex() if tree.size > 0 else None,
+    }

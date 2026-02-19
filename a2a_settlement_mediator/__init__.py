@@ -10,8 +10,23 @@ from a2a_settlement_mediator.schemas import (
     Verdict,
     VerdictOutcome,
 )
+from a2a_settlement_mediator.settlement_pipeline import settle
+from a2a_settlement_mediator.worm_schemas import (
+    AP2Mandate,
+    ArbitrationDecision,
+    ArbitrationVerdict,
+    MerkleAppendResult,
+    MerkleProof,
+    NegotiationTranscript,
+    PreDisputeAttestationPayload,
+    SettlementProof,
+    SettlementResult,
+    SettlementStage,
+    TimestampToken,
+)
 
 __all__ = [
+    # Original mediator
     "mediate",
     "collect_evidence",
     "settings",
@@ -21,6 +36,19 @@ __all__ = [
     "Resolution",
     "Verdict",
     "VerdictOutcome",
+    # WORM settlement pipeline
+    "settle",
+    "AP2Mandate",
+    "ArbitrationDecision",
+    "ArbitrationVerdict",
+    "MerkleAppendResult",
+    "MerkleProof",
+    "NegotiationTranscript",
+    "PreDisputeAttestationPayload",
+    "SettlementProof",
+    "SettlementResult",
+    "SettlementStage",
+    "TimestampToken",
 ]
 
 __version__ = "0.1.0"

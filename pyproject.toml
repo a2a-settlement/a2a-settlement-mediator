@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "a2a-settlement-mediator"
 version = "0.1.0"
-description = "AI-powered dispute resolution for the A2A Settlement Exchange. Evaluates deliverables against acceptance criteria and autonomously resolves clear-cut disputes."
+description = "AI-powered dispute resolution and SEC 17a-4 WORM-compliant settlement for the A2A Settlement Exchange."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "a2a-settlement" },
 ]
-keywords = ["a2a", "settlement", "escrow", "dispute", "mediation", "ai", "agents"]
+keywords = ["a2a", "settlement", "escrow", "dispute", "mediation", "ai", "agents", "worm", "sec-17a-4", "rfc3161", "merkle"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

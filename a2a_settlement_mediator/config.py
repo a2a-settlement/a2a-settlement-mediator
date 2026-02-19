@@ -59,5 +59,11 @@ class MediatorSettings:
     # Webhook URL to POST escalation notices to (e.g., Slack incoming webhook).
     escalation_webhook_url: str = os.getenv("MEDIATOR_ESCALATION_WEBHOOK_URL", "")
 
+    # --- SEC 17a-4 WORM Settlement Pipeline ---
+    # RFC 3161 Time Stamp Authority URL (e.g., http://freetsa.org/tsr)
+    tsa_url: str = os.getenv("MEDIATOR_TSA_URL", "http://freetsa.org/tsr")
+    # Maximum seconds to wait for TSA response before hard-failing the settlement.
+    tsa_timeout_seconds: float = _get_float("MEDIATOR_TSA_TIMEOUT", 15.0)
+
 
 settings = MediatorSettings()
