@@ -19,9 +19,15 @@ import pytest
 
 from a2a_settlement_mediator.merkle import MerkleTree
 from a2a_settlement_mediator.settlement_pipeline import (
+    IngestionLimitExceeded,
     SettlementHardFail,
     _build_attestation_payload,
     _call_arbitration_llm,
+    _confirmed_settlements,
+    _validate_ingestion,
+    get_pending_settlements,
+    mark_executed,
+    mark_failed,
     settle,
 )
 from a2a_settlement_mediator.tsa_client import (
@@ -36,11 +42,14 @@ from a2a_settlement_mediator.worm_schemas import (
     ArbitrationDecision,
     ArbitrationRequest,
     ArbitrationVerdict,
+    ExecutionStatus,
     NegotiationTranscript,
     PreDisputeAttestationPayload,
+    SCHEMA_VERSION,
     SettlementResult,
     SettlementStage,
     TimestampToken,
+    export_json_schemas,
 )
 
 # ---------------------------------------------------------------------------
@@ -725,3 +734,256 @@ class TestWORMSchemas:
         assert data["success"] is False
         assert data["stage_reached"] == "arbitration"
         assert data["arbitration_verdict"]["decision"] == "APPROVED"
+
+    def test_settlement_result_has_execution_status(self, sample_verdict):
+        result = SettlementResult(
+            success=True,
+            stage_reached=SettlementStage.COMPLETE,
+            arbitration_verdict=sample_verdict,
+        )
+        assert result.execution_status == ExecutionStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# Ingestion validation tests (Context Bomb mitigation)
+# ---------------------------------------------------------------------------
+
+
+class TestIngestionValidation:
+    def test_valid_ingestion_passes(self, sample_transcript, sample_mandates):
+        _validate_ingestion(sample_transcript, sample_mandates)
+
+    def test_oversized_transcript_hash_rejected(self):
+        transcript = NegotiationTranscript(
+            transcript_hash="a" * 200,
+            source_service="crewai",
+        )
+        with pytest.raises(IngestionLimitExceeded, match="transcript_hash length"):
+            _validate_ingestion(transcript, [])
+
+    def test_too_many_mandates_rejected(self, sample_transcript):
+        mandates = [
+            AP2Mandate(mandate_id=f"M-{i:04d}", description="test")
+            for i in range(60)
+        ]
+        with pytest.raises(IngestionLimitExceeded, match="mandate count"):
+            _validate_ingestion(sample_transcript, mandates)
+
+    def test_oversized_mandate_description_rejected(self, sample_transcript):
+        mandates = [
+            AP2Mandate(mandate_id="M-001", description="x" * 6000)
+        ]
+        with pytest.raises(IngestionLimitExceeded, match="description length"):
+            _validate_ingestion(sample_transcript, mandates)
+
+    def test_too_many_conditions_rejected(self, sample_transcript):
+        mandates = [
+            AP2Mandate(
+                mandate_id="M-001",
+                description="test",
+                conditions=[f"cond-{i}" for i in range(25)],
+            )
+        ]
+        with pytest.raises(IngestionLimitExceeded, match="conditions"):
+            _validate_ingestion(sample_transcript, mandates)
+
+    def test_total_payload_chars_rejected(self, sample_transcript):
+        mandates = [
+            AP2Mandate(mandate_id=f"M-{i:04d}", description="x" * 4000)
+            for i in range(30)
+        ]
+        with pytest.raises(IngestionLimitExceeded, match="total mandate payload"):
+            _validate_ingestion(sample_transcript, mandates)
+
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_settle_rejects_oversized_ingestion(self, mock_llm):
+        transcript = NegotiationTranscript(
+            transcript_hash="a" * 200,
+            source_service="crewai",
+        )
+        result = settle(transcript, [])
+        assert result.success is False
+        assert "Ingestion limit exceeded" in result.error
+        mock_llm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Gatekeeper recovery ledger tests
+# ---------------------------------------------------------------------------
+
+
+class TestGatekeeperRecovery:
+    @patch("a2a_settlement_mediator.settlement_pipeline._request_timestamp")
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_successful_settlement_is_pending(
+        self,
+        mock_llm,
+        mock_timestamp,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        mock_llm.return_value = sample_verdict
+        mock_timestamp.return_value = sample_timestamp
+
+        result = settle(sample_transcript, sample_mandates)
+        assert result.success is True
+        assert result.execution_status == ExecutionStatus.PENDING
+
+        pending = get_pending_settlements()
+        hashes = [r.proof.settlement_hash for r in pending]
+        assert result.proof.settlement_hash in hashes
+
+    @patch("a2a_settlement_mediator.settlement_pipeline._request_timestamp")
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_mark_executed_removes_from_pending(
+        self,
+        mock_llm,
+        mock_timestamp,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        mock_llm.return_value = sample_verdict
+        mock_timestamp.return_value = sample_timestamp
+
+        result = settle(sample_transcript, sample_mandates)
+        settlement_hash = result.proof.settlement_hash
+
+        assert mark_executed(settlement_hash) is True
+
+        pending = get_pending_settlements()
+        hashes = [r.proof.settlement_hash for r in pending]
+        assert settlement_hash not in hashes
+
+    def test_mark_executed_unknown_hash_returns_false(self):
+        assert mark_executed("nonexistent") is False
+
+    @patch("a2a_settlement_mediator.settlement_pipeline._request_timestamp")
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_mark_failed_records_error(
+        self,
+        mock_llm,
+        mock_timestamp,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        mock_llm.return_value = sample_verdict
+        mock_timestamp.return_value = sample_timestamp
+
+        result = settle(sample_transcript, sample_mandates)
+        settlement_hash = result.proof.settlement_hash
+
+        assert mark_failed(settlement_hash, "network error") is True
+
+        from a2a_settlement_mediator.settlement_pipeline import get_confirmed_settlement
+
+        updated = get_confirmed_settlement(settlement_hash)
+        assert updated.execution_status == ExecutionStatus.FAILED
+
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_rejected_settlement_not_in_ledger(
+        self, mock_llm, sample_transcript, sample_mandates
+    ):
+        mock_llm.return_value = ArbitrationVerdict(
+            decision=ArbitrationDecision.REJECTED,
+            confidence=0.88,
+            reasoning="Rejected",
+            llm_model="test",
+        )
+
+        initial_pending = len(get_pending_settlements())
+        result = settle(sample_transcript, sample_mandates)
+        assert result.success is False
+        assert len(get_pending_settlements()) == initial_pending
+
+
+# ---------------------------------------------------------------------------
+# JSON Schema export tests
+# ---------------------------------------------------------------------------
+
+
+class TestJSONSchemaExport:
+    def test_export_returns_all_models(self):
+        schemas = export_json_schemas()
+        expected_models = {
+            "NegotiationTranscript",
+            "AP2Mandate",
+            "ArbitrationVerdict",
+            "PreDisputeAttestationPayload",
+            "TimestampToken",
+            "MerkleProof",
+            "MerkleAppendResult",
+            "SettlementProof",
+            "SettlementResult",
+        }
+        assert set(schemas.keys()) == expected_models
+
+    def test_schemas_have_id_and_version(self):
+        schemas = export_json_schemas()
+        for name, schema in schemas.items():
+            assert "$id" in schema
+            assert SCHEMA_VERSION in schema["$id"]
+            assert "$schema" in schema
+
+    def test_export_to_directory(self, tmp_path):
+        schemas = export_json_schemas(output_dir=tmp_path)
+        for name in schemas:
+            path = tmp_path / f"{name}.v{SCHEMA_VERSION}.schema.json"
+            assert path.exists()
+            content = json.loads(path.read_text())
+            assert content["$id"] == schemas[name]["$id"]
+
+    def test_settlement_proof_has_schema_version(self):
+        schemas = export_json_schemas()
+        proof_schema = schemas["SettlementProof"]
+        props = proof_schema.get("properties", {})
+        assert "schema_version" in props
+
+
+# ---------------------------------------------------------------------------
+# Settlement endpoint recovery tests
+# ---------------------------------------------------------------------------
+
+
+class TestSettlementRecoveryEndpoints:
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from a2a_settlement_mediator.webhook_listener import app
+
+        return TestClient(app)
+
+    def test_pending_endpoint(self, client):
+        resp = client.get("/settlements/pending")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pending" in data
+        assert "count" in data
+
+    def test_ack_unknown_hash_returns_404(self, client):
+        resp = client.post(
+            "/settlements/ack",
+            json={"settlement_hash": "nonexistent", "status": "executed"},
+        )
+        assert resp.status_code == 404
+
+    def test_ack_invalid_status_returns_400(self, client):
+        resp = client.post(
+            "/settlements/ack",
+            json={"settlement_hash": "abc", "status": "invalid_status"},
+        )
+        assert resp.status_code == 400
+
+    def test_schemas_endpoint(self, client):
+        resp = client.get("/schemas")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "schema_version" in data
+        assert data["schema_version"] == SCHEMA_VERSION
+        assert "SettlementProof" in data["schemas"]

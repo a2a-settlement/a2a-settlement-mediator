@@ -66,6 +66,8 @@ All settings via environment variables (see `.env.example`):
 | `MEDIATOR_PORT` | `3100` | Webhook listener port |
 | `MEDIATOR_WEBHOOK_SECRET` | — | HMAC secret for verifying exchange webhooks |
 | `MEDIATOR_ESCALATION_WEBHOOK_URL` | — | Slack/webhook URL for escalation notices |
+| `MEDIATOR_TSA_URL` | `http://freetsa.org/tsr` | RFC 3161 Time Stamp Authority URL |
+| `MEDIATOR_TSA_TIMEOUT` | `15` | Seconds before TSA hard-fail |
 
 ## Exchange Setup
 
@@ -88,6 +90,8 @@ client.set_webhook(
 
 ## API Endpoints
 
+### Mediation
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Health check with config summary |
@@ -95,6 +99,17 @@ client.set_webhook(
 | `POST` | `/mediate/{escrow_id}` | Manually trigger mediation (sync) |
 | `GET` | `/audits` | List mediation audit records |
 | `GET` | `/audits/{escrow_id}` | Get audit record for a specific escrow |
+
+### SEC 17a-4 WORM Settlement
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/settle` | Run the full settlement pipeline (arbitration → timestamp → Merkle → proof) |
+| `GET` | `/settlements` | List recent settlement results |
+| `GET` | `/merkle` | Current Merkle Tree state (size + root hash) |
+| `GET` | `/settlements/pending` | Confirmed settlements awaiting mandate execution (recovery) |
+| `POST` | `/settlements/ack` | Acknowledge mandate execution (mark executed/failed) |
+| `GET` | `/schemas` | Versioned JSON Schema definitions for all attestation models |
 
 ## Decision Framework
 
@@ -129,28 +144,99 @@ pip install -e ".[dev]"
 pytest
 ```
 
+## SEC 17a-4 WORM Settlement Pipeline
+
+The mediator includes a separate settlement pipeline designed for SEC 17a-4 WORM compliance. It consumes negotiation transcripts from CrewAI and aligns them with AP2 mandates to create a formal bridge between "Natural Language Intent" and "Cryptographic Execution."
+
+```
+CrewAI transcript (hashed)
++ AP2 mandates
+        │
+        ▼
+┌───────────────┐  1. ARBITRATION     LLM evaluates mandate compliance
+│  Orchestrator │  2. ATTESTATION     Build immutable payload + SHA-256 seal
+│               │  3. TIMESTAMPING    RFC 3161 timestamp from TSA
+│               │  4. MERKLE APPEND   Append to append-only Merkle Tree
+│               │  5. VERIFY          Mathematical proof verification
+│               │  6. PROOF           Assemble cryptographic proof bundle
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│  Gatekeeper   │──── Mandate released ONLY after Merkle leaf confirmed
+│               │──── Recovery: re-emit for confirmed-but-unexecuted leaves
+└───────────────┘
+```
+
+### Merkle Tree Specification
+
+The Scribe uses a **SHA-256 binary Merkle Tree** with domain-separated hashing (prevents second-preimage attacks):
+
+- **Leaf nodes:** `H(0x00 || data)`
+- **Internal nodes:** `H(0x01 || left || right)`
+- **Tree structure:** Unbalanced binary tree (RFC 6962 §2.1 style). When the leaf count is not a power of two, the last leaf at each level is promoted without a sibling. The shape is fully deterministic given the leaf count.
+- **Append-only:** Leaves are never removed or mutated (WORM semantics).
+- **Thread-safe:** All mutations serialized via lock.
+
+Third-party verification requires only the leaf data, sibling path, and the root hash at insertion time — no tree access needed.
+
+### Gatekeeper Recovery
+
+If the Merkle append succeeds but the network fails before the mandate is released to the execution engine:
+
+1. The pipeline records every confirmed settlement in a recovery ledger (`GET /settlements/pending`)
+2. The execution engine polls for pending mandates and re-emits them
+3. After successful execution, it acknowledges via `POST /settlements/ack`
+
+This prevents "Phantom Settlements" where a payment occurs without an audit trail, and also prevents the inverse — a confirmed audit leaf with no corresponding execution.
+
+### Attestation Schema
+
+All attestation payloads carry a `payload_version` / `schema_version` field. Versioned JSON Schema definitions are available at `GET /schemas` for external auditors and peer mediators to validate settlement proofs without the mediator's source code.
+
+### Ingestion Limits (Context Bomb Mitigation)
+
+To prevent malicious agents from flooding the mediator with oversized payloads (driving up LLM costs or causing timeouts), the pipeline enforces configurable limits:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEDIATOR_MAX_TRANSCRIPT_HASH_LENGTH` | `128` | Max hex chars in transcript hash |
+| `MEDIATOR_MAX_MANDATES` | `50` | Max AP2 mandates per request |
+| `MEDIATOR_MAX_MANDATE_PAYLOAD_CHARS` | `100000` | Max total chars across all mandate text |
+| `MEDIATOR_MAX_MANDATE_DESC_LENGTH` | `5000` | Max chars per mandate description |
+| `MEDIATOR_MAX_CONDITIONS_PER_MANDATE` | `20` | Max conditions per mandate |
+
+HTTP requests exceeding 1 MiB are rejected at the middleware layer before any parsing occurs.
+
 ## Architecture
 
 ```
 a2a_settlement_mediator/
-├── __init__.py          # Public API
-├── __main__.py          # CLI entrypoint
-├── config.py            # Environment-driven settings
-├── schemas.py           # Evidence, Verdict, AuditRecord models
-├── evidence.py          # Evidence collection from exchange API
-├── prompts.py           # LLM prompt templates
-├── mediator.py          # Core mediation pipeline
-└── webhook_listener.py  # FastAPI webhook receiver
+├── __init__.py              # Public API
+├── __main__.py              # CLI entrypoint
+├── config.py                # Environment-driven settings
+├── schemas.py               # Evidence, Verdict, AuditRecord models
+├── worm_schemas.py          # WORM compliance models + JSON Schema export
+├── evidence.py              # Evidence collection from exchange API
+├── prompts.py               # LLM prompt templates (mediation)
+├── arbitration_prompts.py   # LLM prompt templates (WORM arbitration)
+├── mediator.py              # Core mediation pipeline
+├── settlement_pipeline.py   # WORM settlement pipeline + Gatekeeper recovery
+├── merkle.py                # SHA-256 Merkle Tree (RFC 6962 §2.1 style)
+├── tsa_client.py            # RFC 3161 TSA client (minimal DER encoder)
+└── webhook_listener.py      # FastAPI webhook receiver + settlement API
 ```
 
 ## Roadmap
 
-- [ ] Persistent audit storage (SQLite/Postgres)
+- [ ] Persistent audit + Merkle storage (SQLite/Postgres backing for WORM tree and recovery ledger)
 - [ ] Artifact content inspection (fetch and verify deliverable content)
 - [ ] Multi-LLM consensus (2-of-3 agreement for high-value disputes)
+- [ ] **Multi-Sig / Consensus Mediator** — Support multiple auditors that must agree before the Gatekeeper releases a mandate (threshold signatures or BFT consensus)
 - [ ] Partial resolution support (split escrow between parties)
 - [ ] A2A task history integration (review full task conversation)
 - [ ] Prometheus metrics endpoint
+- [ ] Streaming transcript ingestion with back-pressure (complement to Context Bomb limits)
 
 ## Related
 

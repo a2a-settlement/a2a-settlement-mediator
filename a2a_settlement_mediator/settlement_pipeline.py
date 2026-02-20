@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -38,6 +39,7 @@ from a2a_settlement_mediator.worm_schemas import (
     ArbitrationDecision,
     ArbitrationRequest,
     ArbitrationVerdict,
+    ExecutionStatus,
     MerkleAppendResult,
     MerkleLeaf,
     MerkleProof,
@@ -64,8 +66,132 @@ def get_merkle_tree() -> MerkleTree:
     return _merkle_tree
 
 
+# ---------------------------------------------------------------------------
+# Gatekeeper recovery ledger
+# ---------------------------------------------------------------------------
+# Maps settlement_hash → SettlementResult for completed settlements whose
+# Merkle leaf is confirmed but whose mandate has not yet been released to
+# the execution engine.  In production this would be backed by durable
+# storage; the in-memory dict is sufficient for demonstrating the pattern.
+
+_confirmed_settlements: dict[str, SettlementResult] = {}
+_confirmed_lock = threading.Lock()
+
+
+def _record_confirmed(result: SettlementResult) -> None:
+    """Record a settlement whose Merkle leaf is confirmed."""
+    if result.proof is None:
+        return
+    with _confirmed_lock:
+        _confirmed_settlements[result.proof.settlement_hash] = result
+
+
+def mark_executed(settlement_hash: str) -> bool:
+    """Mark a confirmed settlement as successfully executed.
+
+    Called by the execution engine after the AP2 Mandate has been
+    released.  Returns True if the settlement was found and marked.
+    """
+    with _confirmed_lock:
+        result = _confirmed_settlements.get(settlement_hash)
+        if result is None:
+            return False
+        result.execution_status = ExecutionStatus.EXECUTED
+        return True
+
+
+def mark_failed(settlement_hash: str, error: str) -> bool:
+    """Mark a confirmed settlement as failed during execution.
+
+    Returns True if the settlement was found and marked.
+    """
+    with _confirmed_lock:
+        result = _confirmed_settlements.get(settlement_hash)
+        if result is None:
+            return False
+        result.execution_status = ExecutionStatus.FAILED
+        result.error = error
+        return True
+
+
+def get_pending_settlements() -> list[SettlementResult]:
+    """Return all confirmed settlements that have not been marked executed.
+
+    The Gatekeeper's recovery loop should periodically call this and
+    re-emit the AP2 Mandate for each pending settlement.
+    """
+    with _confirmed_lock:
+        return [
+            r
+            for r in _confirmed_settlements.values()
+            if r.execution_status == ExecutionStatus.PENDING
+        ]
+
+
+def get_confirmed_settlement(settlement_hash: str) -> SettlementResult | None:
+    """Look up a confirmed settlement by its settlement hash."""
+    with _confirmed_lock:
+        return _confirmed_settlements.get(settlement_hash)
+
+
 class SettlementHardFail(Exception):
     """Raised when the pipeline must abort with no partial result."""
+
+
+class IngestionLimitExceeded(ValueError):
+    """Raised when inbound data exceeds configured size limits.
+
+    Prevents "Context Bomb" attacks where a malicious agent floods the
+    mediator with oversized payloads to drive up LLM costs or cause
+    evaluation timeouts.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Ingestion validation (Context Bomb mitigation)
+# ---------------------------------------------------------------------------
+
+
+def _validate_ingestion(
+    transcript: NegotiationTranscript,
+    mandates: list[AP2Mandate],
+) -> None:
+    """Enforce size limits on transcript and mandate payloads.
+
+    Raises IngestionLimitExceeded if any limit is breached.
+    """
+    if len(transcript.transcript_hash) > settings.max_transcript_hash_length:
+        raise IngestionLimitExceeded(
+            f"transcript_hash length {len(transcript.transcript_hash)} exceeds "
+            f"limit of {settings.max_transcript_hash_length} characters"
+        )
+
+    if len(mandates) > settings.max_mandates_per_settlement:
+        raise IngestionLimitExceeded(
+            f"mandate count {len(mandates)} exceeds "
+            f"limit of {settings.max_mandates_per_settlement}"
+        )
+
+    total_chars = 0
+    for m in mandates:
+        if len(m.description) > settings.max_mandate_description_length:
+            raise IngestionLimitExceeded(
+                f"mandate {m.mandate_id!r} description length "
+                f"{len(m.description)} exceeds limit of "
+                f"{settings.max_mandate_description_length}"
+            )
+        if len(m.conditions) > settings.max_conditions_per_mandate:
+            raise IngestionLimitExceeded(
+                f"mandate {m.mandate_id!r} has {len(m.conditions)} conditions, "
+                f"exceeding limit of {settings.max_conditions_per_mandate}"
+            )
+        total_chars += len(m.description) + sum(len(c) for c in m.conditions)
+
+    if total_chars > settings.max_mandate_payload_chars:
+        raise IngestionLimitExceeded(
+            f"total mandate payload size {total_chars} chars exceeds "
+            f"limit of {settings.max_mandate_payload_chars}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +441,19 @@ def settle(
         escrow_id or "none",
     )
 
+    # --- Stage 0: Ingestion validation (Context Bomb mitigation) ---
+    try:
+        _validate_ingestion(transcript, mandates)
+    except IngestionLimitExceeded as exc:
+        logger.warning("Ingestion rejected: %s", exc)
+        return SettlementResult(
+            success=False,
+            error=f"Ingestion limit exceeded: {exc}",
+            stage_reached=stage,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc),
+        )
+
     request = ArbitrationRequest(
         transcript=transcript,
         mandates=mandates,
@@ -435,11 +574,16 @@ def settle(
         merkle_result.tree_size,
     )
 
-    return SettlementResult(
+    result = SettlementResult(
         success=True,
         proof=proof,
         stage_reached=stage,
         arbitration_verdict=verdict,
+        execution_status=ExecutionStatus.PENDING,
         started_at=started_at,
         completed_at=datetime.now(timezone.utc),
     )
+
+    _record_confirmed(result)
+
+    return result

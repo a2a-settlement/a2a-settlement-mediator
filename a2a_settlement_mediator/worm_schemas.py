@@ -3,15 +3,24 @@
 Covers the full lifecycle: negotiation transcript ingestion, AP2 mandate
 evaluation, arbitration decisions, pre-dispute attestation payloads,
 RFC 3161 timestamps, Merkle Tree proofs, and final settlement results.
+
+All payload models carry a ``payload_version`` / ``schema_version`` field
+so that external auditors and peer mediators can parse records regardless
+of which software version produced them.  Use ``export_json_schemas()``
+to emit versioned JSON Schema definitions suitable for publication.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 from pydantic import BaseModel, Field
+
+SCHEMA_VERSION = "1.0"
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -106,7 +115,7 @@ class PreDisputeAttestationPayload(BaseModel):
     would invalidate downstream timestamps and Merkle proofs.
     """
 
-    payload_version: str = "1.0"
+    payload_version: str = SCHEMA_VERSION
     transcript: NegotiationTranscript
     mandates: list[AP2Mandate]
     verdict: ArbitrationVerdict
@@ -123,13 +132,11 @@ class PreDisputeAttestationPayload(BaseModel):
     ) -> str:
         """Compute the deterministic SHA-256 hash over the attestation contents."""
         canonical = {
-            "payload_version": "1.0",
+            "payload_version": SCHEMA_VERSION,
             "transcript": transcript.model_dump(mode="json"),
             "mandates": [m.model_dump(mode="json") for m in mandates],
             "verdict": verdict.model_dump(mode="json"),
         }
-        import json
-
         raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -198,6 +205,10 @@ class MerkleAppendResult(BaseModel):
 class SettlementProof(BaseModel):
     """Complete cryptographic proof bundle for a WORM-compliant settlement."""
 
+    schema_version: str = Field(
+        default=SCHEMA_VERSION,
+        description="Schema version for external auditors to select the correct parser",
+    )
     attestation_payload: PreDisputeAttestationPayload
     timestamp: TimestampToken
     merkle_result: MerkleAppendResult
@@ -205,6 +216,14 @@ class SettlementProof(BaseModel):
         ..., description="SHA-256 tying attestation hash, timestamp, and Merkle root together"
     )
     completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ExecutionStatus(str, Enum):
+    """Tracks whether the settlement mandate has been released to the execution engine."""
+
+    PENDING = "pending"
+    EXECUTED = "executed"
+    FAILED = "failed"
 
 
 class SettlementResult(BaseModel):
@@ -215,5 +234,48 @@ class SettlementResult(BaseModel):
     error: str | None = None
     stage_reached: SettlementStage
     arbitration_verdict: ArbitrationVerdict | None = None
+    execution_status: ExecutionStatus = ExecutionStatus.PENDING
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# JSON Schema export for external auditors
+# ---------------------------------------------------------------------------
+
+_SCHEMA_MODELS: dict[str, type[BaseModel]] = {
+    "NegotiationTranscript": NegotiationTranscript,
+    "AP2Mandate": AP2Mandate,
+    "ArbitrationVerdict": ArbitrationVerdict,
+    "PreDisputeAttestationPayload": PreDisputeAttestationPayload,
+    "TimestampToken": TimestampToken,
+    "MerkleProof": MerkleProof,
+    "MerkleAppendResult": MerkleAppendResult,
+    "SettlementProof": SettlementProof,
+    "SettlementResult": SettlementResult,
+}
+
+
+def export_json_schemas(output_dir: str | Path | None = None) -> dict[str, dict]:
+    """Generate versioned JSON Schema definitions for all attestation models.
+
+    If *output_dir* is provided, each schema is also written to
+    ``<output_dir>/<ModelName>.v<version>.schema.json``.
+
+    Returns a dict mapping model name to its JSON Schema dict.
+    """
+    schemas: dict[str, dict] = {}
+    for name, model_cls in _SCHEMA_MODELS.items():
+        schema = model_cls.model_json_schema()
+        schema["$id"] = f"https://a2a-settlement.org/schemas/{name}/v{SCHEMA_VERSION}"
+        schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+        schemas[name] = schema
+
+    if output_dir is not None:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        for name, schema in schemas.items():
+            path = out / f"{name}.v{SCHEMA_VERSION}.schema.json"
+            path.write_text(json.dumps(schema, indent=2) + "\n")
+
+    return schemas

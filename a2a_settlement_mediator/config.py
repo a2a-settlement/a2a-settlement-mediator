@@ -65,5 +65,17 @@ class MediatorSettings:
     # Maximum seconds to wait for TSA response before hard-failing the settlement.
     tsa_timeout_seconds: float = _get_float("MEDIATOR_TSA_TIMEOUT", 15.0)
 
+    # --- Ingestion limits (Context Bomb mitigation) ---
+    # Maximum length of the transcript_hash field (hex chars). SHA-256 = 64.
+    max_transcript_hash_length: int = _get_int("MEDIATOR_MAX_TRANSCRIPT_HASH_LENGTH", 128)
+    # Maximum number of AP2 mandates per settlement request.
+    max_mandates_per_settlement: int = _get_int("MEDIATOR_MAX_MANDATES", 50)
+    # Maximum total characters across all mandate descriptions + conditions.
+    max_mandate_payload_chars: int = _get_int("MEDIATOR_MAX_MANDATE_PAYLOAD_CHARS", 100_000)
+    # Maximum length of a single mandate description (chars).
+    max_mandate_description_length: int = _get_int("MEDIATOR_MAX_MANDATE_DESC_LENGTH", 5_000)
+    # Maximum number of conditions per mandate.
+    max_conditions_per_mandate: int = _get_int("MEDIATOR_MAX_CONDITIONS_PER_MANDATE", 20)
+
 
 settings = MediatorSettings()

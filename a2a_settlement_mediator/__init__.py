@@ -10,11 +10,18 @@ from a2a_settlement_mediator.schemas import (
     Verdict,
     VerdictOutcome,
 )
-from a2a_settlement_mediator.settlement_pipeline import settle
+from a2a_settlement_mediator.settlement_pipeline import (
+    IngestionLimitExceeded,
+    get_pending_settlements,
+    mark_executed,
+    mark_failed,
+    settle,
+)
 from a2a_settlement_mediator.worm_schemas import (
     AP2Mandate,
     ArbitrationDecision,
     ArbitrationVerdict,
+    ExecutionStatus,
     MerkleAppendResult,
     MerkleProof,
     NegotiationTranscript,
@@ -38,9 +45,14 @@ __all__ = [
     "VerdictOutcome",
     # WORM settlement pipeline
     "settle",
+    "IngestionLimitExceeded",
+    "get_pending_settlements",
+    "mark_executed",
+    "mark_failed",
     "AP2Mandate",
     "ArbitrationDecision",
     "ArbitrationVerdict",
+    "ExecutionStatus",
     "MerkleAppendResult",
     "MerkleProof",
     "NegotiationTranscript",

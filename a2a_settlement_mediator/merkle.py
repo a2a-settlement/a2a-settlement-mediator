@@ -1,11 +1,32 @@
 """Thread-safe SHA-256 Merkle Tree for WORM-compliant audit trails.
 
-Implements a standard binary Merkle Tree with domain-separated hashing:
+Specification (for third-party verifiers)
+==========================================
+
+**Hash algorithm:** SHA-256 (FIPS 180-4 / RFC 6234)
+
+**Domain-separated hashing** (prevents second-preimage attacks where
+an internal node could be reinterpreted as a leaf):
+
 - Leaf nodes:     H(0x00 || data)
 - Internal nodes: H(0x01 || left || right)
 
-This prevents second-preimage attacks where an internal node could be
-reinterpreted as a leaf.
+**Tree structure:** Unbalanced binary Merkle Tree. When the number of
+leaves is not a power of two, the last leaf at each level is promoted
+to the next level without a sibling hash. This is the same approach
+used by Certificate Transparency (RFC 6962 §2.1). The tree is *not*
+padded or rebalanced — the shape is fully deterministic given the
+number of leaves, which means any verifier can reconstruct the
+expected root from a leaf, its index, the tree size, and the sibling
+path.
+
+**Append-only semantics:** Leaves are never removed or mutated.
+Appending a new leaf changes the root hash but does not alter any
+existing leaf hash or previously issued inclusion proof (when verified
+against the root at the time the proof was generated).
+
+**Thread safety:** All mutations and reads are serialized via a
+reentrant lock.
 """
 
 from __future__ import annotations
@@ -19,6 +40,14 @@ class MerkleTree:
 
     Thread-safe for concurrent appends and proof generation.
     Leaves are never removed (WORM semantics).
+
+    Verification by third parties requires only:
+    - The leaf data (to recompute the leaf hash)
+    - The sibling path (from ``get_proof`` / ``append_and_prove``)
+    - The expected root hash at the time of insertion
+
+    No access to the tree instance is needed — use the static
+    ``verify_proof`` class method.
     """
 
     _LEAF_PREFIX = b"\x00"
