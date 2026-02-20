@@ -38,11 +38,14 @@ from a2a_settlement_mediator.tsa_client import (
     parse_timestamp_response_status,
 )
 from a2a_settlement_mediator.worm_schemas import (
+    AgentIdentity,
     AP2Mandate,
     ArbitrationDecision,
     ArbitrationRequest,
     ArbitrationVerdict,
+    CurrencyPrecision,
     ExecutionStatus,
+    MerkleLeafPayload,
     NegotiationTranscript,
     PreDisputeAttestationPayload,
     SCHEMA_VERSION,
@@ -108,6 +111,19 @@ def sample_timestamp():
         timestamp_token_b64=base64.b64encode(b"mock-tsa-response").decode(),
         serial_number="12345",
     )
+
+
+@pytest.fixture
+def sample_agent_identities():
+    return [
+        AgentIdentity(agent_id="agent-buyer-001", role="buyer"),
+        AgentIdentity(agent_id="agent-seller-002", role="seller"),
+    ]
+
+
+@pytest.fixture
+def sample_currency_precision():
+    return CurrencyPrecision(currency_code="USD", decimal_places=2)
 
 
 def _make_approved_llm_response() -> dict:
@@ -397,7 +413,7 @@ class TestAttestationPayload:
         payload = _build_attestation_payload(
             sample_transcript, sample_mandates, sample_verdict
         )
-        assert payload.payload_version == "1.0"
+        assert payload.payload_version == SCHEMA_VERSION
         assert payload.verdict.decision == ArbitrationDecision.APPROVED
         assert len(payload.payload_hash) == 64
 
@@ -916,6 +932,9 @@ class TestJSONSchemaExport:
             "ArbitrationVerdict",
             "PreDisputeAttestationPayload",
             "TimestampToken",
+            "AgentIdentity",
+            "CurrencyPrecision",
+            "MerkleLeafPayload",
             "MerkleProof",
             "MerkleAppendResult",
             "SettlementProof",
@@ -987,3 +1006,256 @@ class TestSettlementRecoveryEndpoints:
         assert "schema_version" in data
         assert data["schema_version"] == SCHEMA_VERSION
         assert "SettlementProof" in data["schemas"]
+
+
+# ---------------------------------------------------------------------------
+# Schema hardening tests (AgentIdentity, CurrencyPrecision, MerkleLeafPayload)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentIdentity:
+    def test_valid_identity(self):
+        ai = AgentIdentity(agent_id="agent-001", role="buyer")
+        assert ai.agent_id == "agent-001"
+        assert ai.role == "buyer"
+        assert ai.protocol_version == "2.0"
+
+    def test_custom_protocol_version(self):
+        ai = AgentIdentity(agent_id="agent-001", role="seller", protocol_version="3.0")
+        assert ai.protocol_version == "3.0"
+
+    def test_empty_agent_id_rejected(self):
+        with pytest.raises(Exception):
+            AgentIdentity(agent_id="", role="buyer")
+
+    def test_empty_role_rejected(self):
+        with pytest.raises(Exception):
+            AgentIdentity(agent_id="agent-001", role="")
+
+
+class TestCurrencyPrecision:
+    def test_valid_usd(self):
+        cp = CurrencyPrecision(currency_code="USD", decimal_places=2)
+        assert cp.currency_code == "USD"
+        assert cp.decimal_places == 2
+
+    def test_valid_btc(self):
+        cp = CurrencyPrecision(currency_code="BTC", decimal_places=8)
+        assert cp.decimal_places == 8
+
+    def test_invalid_currency_code_lowercase(self):
+        with pytest.raises(Exception):
+            CurrencyPrecision(currency_code="usd", decimal_places=2)
+
+    def test_invalid_currency_code_too_long(self):
+        with pytest.raises(Exception):
+            CurrencyPrecision(currency_code="USDT", decimal_places=2)
+
+    def test_invalid_currency_code_too_short(self):
+        with pytest.raises(Exception):
+            CurrencyPrecision(currency_code="US", decimal_places=2)
+
+    def test_negative_decimal_places_rejected(self):
+        with pytest.raises(Exception):
+            CurrencyPrecision(currency_code="USD", decimal_places=-1)
+
+    def test_excessive_decimal_places_rejected(self):
+        with pytest.raises(Exception):
+            CurrencyPrecision(currency_code="USD", decimal_places=19)
+
+    def test_max_decimal_places_accepted(self):
+        cp = CurrencyPrecision(currency_code="ETH", decimal_places=18)
+        assert cp.decimal_places == 18
+
+
+class TestMerkleLeafPayload:
+    def test_compute_hash_deterministic(
+        self,
+        sample_agent_identities,
+        sample_currency_precision,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        attestation = _build_attestation_payload(
+            sample_transcript, sample_mandates, sample_verdict
+        )
+        h1 = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, sample_currency_precision, attestation, sample_timestamp
+        )
+        h2 = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, sample_currency_precision, attestation, sample_timestamp
+        )
+        assert h1 == h2
+        assert len(h1) == 64
+
+    def test_compute_hash_changes_with_different_identities(
+        self,
+        sample_agent_identities,
+        sample_currency_precision,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        attestation = _build_attestation_payload(
+            sample_transcript, sample_mandates, sample_verdict
+        )
+        h1 = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, sample_currency_precision, attestation, sample_timestamp
+        )
+        different_ids = [
+            AgentIdentity(agent_id="other-buyer", role="buyer"),
+            AgentIdentity(agent_id="other-seller", role="seller"),
+        ]
+        h2 = MerkleLeafPayload.compute_hash(
+            different_ids, sample_currency_precision, attestation, sample_timestamp
+        )
+        assert h1 != h2
+
+    def test_compute_hash_changes_with_different_currency(
+        self,
+        sample_agent_identities,
+        sample_currency_precision,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        attestation = _build_attestation_payload(
+            sample_transcript, sample_mandates, sample_verdict
+        )
+        h1 = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, sample_currency_precision, attestation, sample_timestamp
+        )
+        different_cp = CurrencyPrecision(currency_code="EUR", decimal_places=2)
+        h2 = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, different_cp, attestation, sample_timestamp
+        )
+        assert h1 != h2
+
+    def test_construct_full_payload(
+        self,
+        sample_agent_identities,
+        sample_currency_precision,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        attestation = _build_attestation_payload(
+            sample_transcript, sample_mandates, sample_verdict
+        )
+        h = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, sample_currency_precision, attestation, sample_timestamp
+        )
+        payload = MerkleLeafPayload(
+            agent_identities=sample_agent_identities,
+            currency_precision=sample_currency_precision,
+            attestation=attestation,
+            timestamp=sample_timestamp,
+            payload_hash=h,
+        )
+        assert payload.leaf_version == SCHEMA_VERSION
+        assert len(payload.agent_identities) == 2
+        assert payload.currency_precision.currency_code == "USD"
+        assert len(payload.payload_hash) == 64
+
+    def test_too_few_identities_rejected(
+        self,
+        sample_currency_precision,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        attestation = _build_attestation_payload(
+            sample_transcript, sample_mandates, sample_verdict
+        )
+        with pytest.raises(Exception):
+            MerkleLeafPayload(
+                agent_identities=[AgentIdentity(agent_id="solo", role="buyer")],
+                currency_precision=sample_currency_precision,
+                attestation=attestation,
+                timestamp=sample_timestamp,
+                payload_hash="a" * 64,
+            )
+
+    def test_serialization_roundtrip(
+        self,
+        sample_agent_identities,
+        sample_currency_precision,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        attestation = _build_attestation_payload(
+            sample_transcript, sample_mandates, sample_verdict
+        )
+        h = MerkleLeafPayload.compute_hash(
+            sample_agent_identities, sample_currency_precision, attestation, sample_timestamp
+        )
+        payload = MerkleLeafPayload(
+            agent_identities=sample_agent_identities,
+            currency_precision=sample_currency_precision,
+            attestation=attestation,
+            timestamp=sample_timestamp,
+            payload_hash=h,
+        )
+        data = json.loads(payload.model_dump_json())
+        assert data["leaf_version"] == SCHEMA_VERSION
+        assert len(data["agent_identities"]) == 2
+        assert data["agent_identities"][0]["agent_id"] == "agent-buyer-001"
+        assert data["currency_precision"]["currency_code"] == "USD"
+        assert data["currency_precision"]["decimal_places"] == 2
+
+
+class TestSettlePipelineWithSchemaHardening:
+    @patch("a2a_settlement_mediator.settlement_pipeline._request_timestamp")
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_settle_with_explicit_identities_and_precision(
+        self,
+        mock_llm,
+        mock_timestamp,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+        sample_agent_identities,
+        sample_currency_precision,
+    ):
+        mock_llm.return_value = sample_verdict
+        mock_timestamp.return_value = sample_timestamp
+
+        result = settle(
+            sample_transcript,
+            sample_mandates,
+            agent_identities=sample_agent_identities,
+            currency_precision=sample_currency_precision,
+        )
+
+        assert result.success is True
+        assert result.proof is not None
+        assert result.proof.merkle_result.verified is True
+
+    @patch("a2a_settlement_mediator.settlement_pipeline._request_timestamp")
+    @patch("a2a_settlement_mediator.settlement_pipeline._call_arbitration_llm")
+    def test_settle_defaults_identities_and_precision(
+        self,
+        mock_llm,
+        mock_timestamp,
+        sample_transcript,
+        sample_mandates,
+        sample_verdict,
+        sample_timestamp,
+    ):
+        """settle() works with no agent_identities/currency_precision (uses defaults)."""
+        mock_llm.return_value = sample_verdict
+        mock_timestamp.return_value = sample_timestamp
+
+        result = settle(sample_transcript, sample_mandates)
+
+        assert result.success is True
+        assert result.proof is not None

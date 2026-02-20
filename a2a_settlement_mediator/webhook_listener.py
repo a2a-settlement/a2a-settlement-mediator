@@ -10,7 +10,9 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -18,6 +20,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from a2a_settlement_mediator.config import settings
+from a2a_settlement_mediator.heartbeat import HeartbeatWorker
 from a2a_settlement_mediator.mediator import mediate
 from a2a_settlement_mediator.schemas import AuditRecord, WebhookPayload
 from a2a_settlement_mediator.settlement_pipeline import (
@@ -29,7 +32,9 @@ from a2a_settlement_mediator.settlement_pipeline import (
     settle,
 )
 from a2a_settlement_mediator.worm_schemas import (
+    AgentIdentity,
     AP2Mandate,
+    CurrencyPrecision,
     NegotiationTranscript,
     SCHEMA_VERSION,
     SettlementResult,
@@ -58,13 +63,26 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# Heartbeat recovery worker
+_heartbeat = HeartbeatWorker()
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    _heartbeat.start()
+    yield
+    _heartbeat.stop()
+
+
 app = FastAPI(
     title="A2A Settlement Mediator",
     description="AI-powered dispute resolution sidecar for the A2A Settlement Exchange",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 
 app.add_middleware(_BodySizeLimitMiddleware)
+
 
 # Thread pool for background mediation (webhook must respond quickly)
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mediator")
@@ -224,6 +242,8 @@ class SettlementRequest(BaseModel):
     session_id: str | None = None
     mandates: list[dict]
     escrow_id: str | None = None
+    agent_identities: list[dict] | None = None
+    currency_precision: dict | None = None
 
 
 @app.post("/settle")
@@ -243,7 +263,24 @@ def trigger_settlement(req: SettlementRequest):
 
     mandates = [AP2Mandate(**m) for m in req.mandates]
 
-    result = settle(transcript, mandates, escrow_id=req.escrow_id)
+    identities = (
+        [AgentIdentity(**a) for a in req.agent_identities]
+        if req.agent_identities
+        else None
+    )
+    precision = (
+        CurrencyPrecision(**req.currency_precision)
+        if req.currency_precision
+        else None
+    )
+
+    result = settle(
+        transcript,
+        mandates,
+        escrow_id=req.escrow_id,
+        agent_identities=identities,
+        currency_precision=precision,
+    )
     _settlement_log.append(result)
 
     return result.model_dump(mode="json")
@@ -315,6 +352,17 @@ def ack_execution(ack: ExecutionAck):
         raise HTTPException(status_code=404, detail="Settlement not found")
 
     return {"settlement_hash": ack.settlement_hash, "status": ack.status}
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat status
+# ---------------------------------------------------------------------------
+
+
+@app.get("/heartbeat/status")
+def heartbeat_status():
+    """Return the current state of the heartbeat recovery worker."""
+    return _heartbeat.status()
 
 
 # ---------------------------------------------------------------------------

@@ -35,13 +35,16 @@ from a2a_settlement_mediator.tsa_client import (
     TSATimeoutError,
 )
 from a2a_settlement_mediator.worm_schemas import (
+    AgentIdentity,
     AP2Mandate,
     ArbitrationDecision,
     ArbitrationRequest,
     ArbitrationVerdict,
+    CurrencyPrecision,
     ExecutionStatus,
     MerkleAppendResult,
     MerkleLeaf,
+    MerkleLeafPayload,
     MerkleProof,
     NegotiationTranscript,
     PreDisputeAttestationPayload,
@@ -132,6 +135,22 @@ def get_confirmed_settlement(settlement_hash: str) -> SettlementResult | None:
     """Look up a confirmed settlement by its settlement hash."""
     with _confirmed_lock:
         return _confirmed_settlements.get(settlement_hash)
+
+
+def get_stale_settlements(threshold_seconds: float) -> list[SettlementResult]:
+    """Return confirmed settlements that have been PENDING longer than *threshold_seconds*.
+
+    Used by the heartbeat worker to detect settlements where the Merkle
+    leaf was committed but execution never completed.
+    """
+    now = datetime.now(timezone.utc)
+    with _confirmed_lock:
+        return [
+            r
+            for r in _confirmed_settlements.values()
+            if r.execution_status == ExecutionStatus.PENDING
+            and (now - r.completed_at).total_seconds() > threshold_seconds
+        ]
 
 
 class SettlementHardFail(Exception):
@@ -411,6 +430,8 @@ def settle(
     transcript: NegotiationTranscript,
     mandates: list[AP2Mandate],
     escrow_id: str | None = None,
+    agent_identities: list[AgentIdentity] | None = None,
+    currency_precision: CurrencyPrecision | None = None,
 ) -> SettlementResult:
     """Run the full SEC 17a-4 WORM-compliant settlement pipeline.
 
@@ -536,15 +557,34 @@ def settle(
 
     # --- Stage 4 + 5: Merkle Tree Append + Verify ---
     stage = SettlementStage.MERKLE_APPEND
-    timestamped_payload_json = json.dumps(
-        {
-            "attestation": attestation.model_dump(mode="json"),
-            "timestamp": timestamp.model_dump(mode="json"),
-        },
+
+    effective_identities = agent_identities or [
+        AgentIdentity(agent_id="unknown-buyer", role="buyer"),
+        AgentIdentity(agent_id="unknown-seller", role="seller"),
+    ]
+    effective_precision = currency_precision or CurrencyPrecision(
+        currency_code="USD", decimal_places=2,
+    )
+
+    leaf_payload_hash = MerkleLeafPayload.compute_hash(
+        agent_identities=effective_identities,
+        currency_precision=effective_precision,
+        attestation=attestation,
+        timestamp=timestamp,
+    )
+    leaf_payload = MerkleLeafPayload(
+        agent_identities=effective_identities,
+        currency_precision=effective_precision,
+        attestation=attestation,
+        timestamp=timestamp,
+        payload_hash=leaf_payload_hash,
+    )
+    leaf_payload_json = json.dumps(
+        leaf_payload.model_dump(mode="json"),
         sort_keys=True,
         separators=(",", ":"),
     )
-    timestamped_payload_bytes = timestamped_payload_json.encode("utf-8")
+    timestamped_payload_bytes = leaf_payload_json.encode("utf-8")
 
     try:
         merkle_result = _append_to_merkle_tree(timestamped_payload_bytes)

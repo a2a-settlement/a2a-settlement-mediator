@@ -65,6 +65,13 @@ class MediatorSettings:
     # Maximum seconds to wait for TSA response before hard-failing the settlement.
     tsa_timeout_seconds: float = _get_float("MEDIATOR_TSA_TIMEOUT", 15.0)
 
+    # --- Heartbeat recovery worker ---
+    heartbeat_interval_seconds: float = _get_float("MEDIATOR_HEARTBEAT_INTERVAL", 30.0)
+    stale_settlement_threshold_seconds: float = _get_float(
+        "MEDIATOR_STALE_SETTLEMENT_THRESHOLD", 120.0
+    )
+    execution_callback_url: str = os.getenv("MEDIATOR_EXECUTION_CALLBACK_URL", "")
+
     # --- Ingestion limits (Context Bomb mitigation) ---
     # Maximum length of the transcript_hash field (hex chars). SHA-256 = 64.
     max_transcript_hash_length: int = _get_int("MEDIATOR_MAX_TRANSCRIPT_HASH_LENGTH", 128)

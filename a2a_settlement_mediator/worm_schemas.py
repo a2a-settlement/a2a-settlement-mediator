@@ -20,7 +20,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -160,6 +160,85 @@ class TimestampToken(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Agent identity & currency precision (Merkle leaf hardening)
+# ---------------------------------------------------------------------------
+
+
+class AgentIdentity(BaseModel):
+    """Identifies a participating agent in a settlement."""
+
+    agent_id: str = Field(..., min_length=1, description="Unique agent identifier")
+    role: str = Field(
+        ...,
+        min_length=1,
+        description="Role in the settlement (e.g. 'buyer', 'seller', 'mediator')",
+    )
+    protocol_version: str = Field(
+        default="2.0", description="A2A protocol version the agent speaks"
+    )
+
+
+class CurrencyPrecision(BaseModel):
+    """Financial precision metadata attached to a settlement leaf."""
+
+    currency_code: str = Field(
+        ...,
+        pattern=r"^[A-Z]{3}$",
+        description="ISO 4217 currency code (e.g. 'USD', 'EUR')",
+    )
+    decimal_places: int = Field(
+        ...,
+        ge=0,
+        le=18,
+        description="Number of decimal places (e.g. 2 for USD, 8 for BTC)",
+    )
+
+
+class MerkleLeafPayload(BaseModel):
+    """Refined, versioned payload that is serialized and appended to the Merkle Tree.
+
+    Replaces the previous dictionary-based construction, adding version
+    tracking, agent identity binding, and currency precision metadata
+    for cross-mediator verification and audit compliance.
+    """
+
+    leaf_version: str = Field(
+        default=SCHEMA_VERSION,
+        description="Schema version of this leaf payload",
+    )
+    agent_identities: list[AgentIdentity] = Field(
+        ...,
+        min_length=2,
+        description="All parties involved in the settlement (minimum two)",
+    )
+    currency_precision: CurrencyPrecision
+    attestation: "PreDisputeAttestationPayload"
+    timestamp: TimestampToken
+    payload_hash: str = Field(
+        ...,
+        description="SHA-256 hex digest of the canonical JSON (excluding this field)",
+    )
+
+    @staticmethod
+    def compute_hash(
+        agent_identities: list[AgentIdentity],
+        currency_precision: CurrencyPrecision,
+        attestation: "PreDisputeAttestationPayload",
+        timestamp: TimestampToken,
+    ) -> str:
+        """Compute the deterministic SHA-256 hash over the leaf payload contents."""
+        canonical = {
+            "leaf_version": SCHEMA_VERSION,
+            "agent_identities": [a.model_dump(mode="json") for a in agent_identities],
+            "currency_precision": currency_precision.model_dump(mode="json"),
+            "attestation": attestation.model_dump(mode="json"),
+            "timestamp": timestamp.model_dump(mode="json"),
+        }
+        raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Merkle Tree proof
 # ---------------------------------------------------------------------------
 
@@ -249,6 +328,9 @@ _SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "ArbitrationVerdict": ArbitrationVerdict,
     "PreDisputeAttestationPayload": PreDisputeAttestationPayload,
     "TimestampToken": TimestampToken,
+    "AgentIdentity": AgentIdentity,
+    "CurrencyPrecision": CurrencyPrecision,
+    "MerkleLeafPayload": MerkleLeafPayload,
     "MerkleProof": MerkleProof,
     "MerkleAppendResult": MerkleAppendResult,
     "SettlementProof": SettlementProof,
