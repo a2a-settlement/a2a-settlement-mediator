@@ -24,6 +24,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    "a2a-settlement @ git+https://github.com/a2a-settlement/a2a-settlement.git#subdirectory=sdk",
     "httpx>=0.27",
     "pydantic>=2.0",
     "litellm>=1.40",

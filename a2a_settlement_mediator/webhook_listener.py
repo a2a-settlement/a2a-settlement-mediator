@@ -23,6 +23,7 @@ from a2a_settlement_mediator.config import settings
 from a2a_settlement_mediator.heartbeat import HeartbeatWorker
 from a2a_settlement_mediator.mediator import mediate
 from a2a_settlement_mediator.schemas import AuditRecord, WebhookPayload
+from a2a_settlement_mediator import storage
 from a2a_settlement_mediator.settlement_pipeline import (
     get_confirmed_settlement,
     get_merkle_tree,
@@ -69,6 +70,7 @@ _heartbeat = HeartbeatWorker()
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    storage.initialize_db()
     _heartbeat.start()
     yield
     _heartbeat.stop()
@@ -86,9 +88,6 @@ app.add_middleware(_BodySizeLimitMiddleware)
 
 # Thread pool for background mediation (webhook must respond quickly)
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mediator")
-
-# In-memory audit log (production: persist to database or object store)
-_audit_log: list[AuditRecord] = []
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +124,7 @@ def _run_mediation(escrow_id: str) -> None:
     """Run mediation in a background thread."""
     try:
         audit = mediate(escrow_id)
-        _audit_log.append(audit)
+        storage.save_audit_record(escrow_id, audit.model_dump_json())
     except Exception:
         logger.exception("Background mediation failed for escrow %s", escrow_id)
 
@@ -199,20 +198,17 @@ async def receive_webhook(
 @app.get("/audits")
 def list_audits(limit: int = 20, offset: int = 0):
     """List recent mediation audit records."""
-    records = _audit_log[offset : offset + limit]
-    return {
-        "audits": [r.model_dump(mode="json") for r in records],
-        "total": len(_audit_log),
-    }
+    records, total = storage.list_audit_records(limit, offset)
+    return {"audits": records, "total": total}
 
 
 @app.get("/audits/{escrow_id}")
 def get_audit(escrow_id: str):
     """Get the audit record for a specific escrow."""
-    for record in reversed(_audit_log):
-        if record.escrow_id == escrow_id:
-            return record.model_dump(mode="json")
-    raise HTTPException(status_code=404, detail="Audit record not found")
+    record = storage.get_audit_record(escrow_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Audit record not found")
+    return record
 
 
 @app.post("/mediate/{escrow_id}")
@@ -223,16 +219,13 @@ def trigger_mediation(escrow_id: str):
     the full audit record.
     """
     audit = mediate(escrow_id)
-    _audit_log.append(audit)
+    storage.save_audit_record(escrow_id, audit.model_dump_json())
     return audit.model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------
 # SEC 17a-4 WORM Settlement Pipeline endpoints
 # ---------------------------------------------------------------------------
-
-_settlement_log: list[SettlementResult] = []
-
 
 class SettlementRequest(BaseModel):
     """Request body for the settlement endpoint."""
@@ -281,7 +274,10 @@ def trigger_settlement(req: SettlementRequest):
         agent_identities=identities,
         currency_precision=precision,
     )
-    _settlement_log.append(result)
+    result_json = result.model_dump_json()
+    settlement_hash = result.settlement_hash if hasattr(result, "settlement_hash") else ""
+    if settlement_hash:
+        storage.save_settlement_result(settlement_hash, result_json)
 
     return result.model_dump(mode="json")
 
@@ -289,11 +285,8 @@ def trigger_settlement(req: SettlementRequest):
 @app.get("/settlements")
 def list_settlements(limit: int = 20, offset: int = 0):
     """List recent settlement results."""
-    records = _settlement_log[offset : offset + limit]
-    return {
-        "settlements": [r.model_dump(mode="json") for r in records],
-        "total": len(_settlement_log),
-    }
+    records, total = storage.list_settlement_results(limit, offset)
+    return {"settlements": records, "total": total}
 
 
 @app.get("/merkle")

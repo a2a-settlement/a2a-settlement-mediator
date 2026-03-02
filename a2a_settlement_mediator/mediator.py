@@ -14,7 +14,6 @@ import logging
 import time
 from datetime import datetime, timezone
 
-import httpx
 import litellm
 
 from a2a_settlement_mediator.config import settings
@@ -133,21 +132,11 @@ def _build_verdict(escrow_id: str, llm_output: dict) -> Verdict:
 
 
 def _execute_resolution(escrow_id: str, resolution: Resolution) -> dict:
-    """Call POST /exchange/resolve on the exchange as the operator."""
-    url = settings.exchange_url.rstrip("/") + "/exchange/resolve"
-    headers = {
-        "Authorization": f"Bearer {settings.operator_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "escrow_id": escrow_id,
-        "resolution": resolution.value,
-    }
+    """Call POST /exchange/resolve on the exchange as the operator using the SDK."""
+    from a2a_settlement_mediator.evidence import _get_sdk_client
 
-    with httpx.Client(timeout=10.0) as client:
-        resp = client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+    client = _get_sdk_client()
+    return client.resolve_escrow(escrow_id=escrow_id, resolution=resolution.value)
 
 
 def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
@@ -157,6 +146,8 @@ def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
             "Dispute %s escalated but no escalation webhook configured", verdict.escrow_id
         )
         return
+
+    import httpx as _httpx
 
     payload = {
         "text": (
@@ -168,7 +159,7 @@ def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
         ),
     }
     try:
-        with httpx.Client(timeout=5.0) as client:
+        with _httpx.Client(timeout=5.0) as client:
             client.post(settings.escalation_webhook_url, json=payload)
     except Exception:
         logger.exception("Failed to send escalation notification")
