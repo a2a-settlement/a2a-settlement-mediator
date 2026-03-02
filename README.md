@@ -59,7 +59,7 @@ All settings via environment variables (see `.env.example`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `A2A_EXCHANGE_URL` | `http://127.0.0.1:3000/v1` | Exchange API base URL |
+| `A2A_EXCHANGE_URL` | `http://127.0.0.1:3000/v1` | Exchange API base URL (include `/v1` — mediator uses direct HTTP calls) |
 | `A2A_OPERATOR_API_KEY` | — | Operator-level API key for resolving disputes |
 | `MEDIATOR_LLM_MODEL` | `anthropic/claude-sonnet-4-20250514` | LiteLLM model string |
 | `MEDIATOR_AUTO_RESOLVE_THRESHOLD` | `0.80` | Confidence threshold for auto-resolution |
@@ -146,7 +146,7 @@ pytest
 
 ## SEC 17a-4 WORM Settlement Pipeline
 
-The mediator includes a separate settlement pipeline designed for SEC 17a-4 WORM compliance. It consumes negotiation transcripts from CrewAI and aligns them with AP2 mandates to create a formal bridge between "Natural Language Intent" and "Cryptographic Execution."
+The mediator includes a separate settlement pipeline designed for SEC 17a-4 WORM compliance. It consumes negotiation transcripts from [crewai-a2a-settlement](https://github.com/a2a-settlement/crewai-a2a-settlement) (or CrewAI workflows) and aligns them with AP2 mandates to create a formal bridge between "Natural Language Intent" and "Cryptographic Execution."
 
 ```
 CrewAI transcript (hashed)
@@ -238,11 +238,18 @@ a2a_settlement_mediator/
 - [ ] Prometheus metrics endpoint
 - [ ] Streaming transcript ingestion with back-pressure (complement to Context Bomb limits)
 
-## Related
+## Related Projects
 
-- [a2a-settlement](https://github.com/a2a-settlement/a2a-settlement) — Core exchange + SDK
-- [crewai-a2a-settlement](https://github.com/a2a-settlement/crewai-a2a-settlement) — CrewAI integration
-- [litellm-a2a-settlement](https://github.com/a2a-settlement/litellm-a2a-settlement) — LiteLLM proxy integration
+| Project | Description |
+|---------|-------------|
+| [a2a-settlement](https://github.com/a2a-settlement/a2a-settlement) | Core exchange + SDK |
+| [a2a-settlement-auth](https://github.com/a2a-settlement/a2a-settlement-auth) | OAuth scopes — `settlement:dispute:resolve` for mediator operators |
+| [a2a-settlement-dashboard](https://github.com/a2a-settlement/a2a-settlement-dashboard) | Human oversight — escalation targets |
+| [a2a-settlement-mcp](https://github.com/a2a-settlement/a2a-settlement-mcp) | MCP server |
+| [langgraph-a2a-settlement](https://github.com/a2a-settlement/langgraph-a2a-settlement) | LangGraph integration |
+| [crewai-a2a-settlement](https://github.com/a2a-settlement/crewai-a2a-settlement) | CrewAI integration — WORM pipeline ingests CrewAI transcripts |
+| [litellm-a2a-settlement](https://github.com/a2a-settlement/litellm-a2a-settlement) | LiteLLM integration |
+| [adk-a2a-settlement](https://github.com/a2a-settlement/adk-a2a-settlement) | Google ADK integration |
 
 ## License
 
