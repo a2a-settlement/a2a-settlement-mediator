@@ -35,6 +35,8 @@ from a2a_settlement_mediator.webhook_listener import app
 
 @pytest.fixture
 def client():
+    from a2a_settlement_mediator import storage
+    storage.initialize_db()
     return TestClient(app)
 
 
@@ -327,6 +329,7 @@ class TestWebhookListener:
         """POST /mediate/{escrow_id} runs synchronous mediation."""
         mock_mediate.return_value = MagicMock(
             model_dump=lambda mode: {"escrow_id": "esc-test", "verdict": {}},
+            model_dump_json=lambda: '{"escrow_id": "esc-test", "verdict": {}}',
         )
         resp = client.post("/mediate/esc-test")
         assert resp.status_code == 200

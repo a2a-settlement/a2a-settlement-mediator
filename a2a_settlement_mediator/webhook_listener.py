@@ -336,8 +336,12 @@ def ack_execution(ack: ExecutionAck):
     """
     if ack.status == "executed":
         found = mark_executed(ack.settlement_hash)
+        if found:
+            storage.mark_settlement_executed(ack.settlement_hash)
     elif ack.status == "failed":
         found = mark_failed(ack.settlement_hash, ack.error or "unknown error")
+        if found:
+            storage.mark_settlement_failed(ack.settlement_hash, ack.error or "unknown error")
     else:
         raise HTTPException(status_code=400, detail=f"Invalid status: {ack.status!r}")
 
