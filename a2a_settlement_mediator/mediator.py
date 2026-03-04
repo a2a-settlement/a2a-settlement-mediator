@@ -2,13 +2,15 @@
 
 Orchestrates the full mediation lifecycle:
 1. Collect evidence from the exchange
-2. Evaluate via LLM
-3. Apply confidence threshold
-4. Execute resolution or escalate
+2. Verify provenance (if present)
+3. Evaluate via LLM
+4. Apply confidence threshold
+5. Execute resolution or escalate
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -19,8 +21,10 @@ import litellm
 from a2a_settlement_mediator.config import settings
 from a2a_settlement_mediator.evidence import collect_evidence
 from a2a_settlement_mediator.prompts import SYSTEM_PROMPT, build_evaluation_prompt
+from a2a_settlement_mediator.provenance import ProvenanceVerifier
 from a2a_settlement_mediator.schemas import (
     AuditRecord,
+    ProvenanceResult,
     Resolution,
     Verdict,
     VerdictOutcome,
@@ -37,12 +41,15 @@ litellm.suppress_debug_info = True
 # ---------------------------------------------------------------------------
 
 
-def _call_llm(evidence_json: str) -> tuple[dict, int, int, int]:
+def _call_llm(
+    evidence_json: str,
+    provenance_result_json: str | None = None,
+) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
     Returns: (parsed_verdict_dict, prompt_tokens, completion_tokens, latency_ms)
     """
-    user_prompt = build_evaluation_prompt(evidence_json)
+    user_prompt = build_evaluation_prompt(evidence_json, provenance_result_json)
 
     t0 = time.monotonic()
     response = litellm.completion(
@@ -131,12 +138,20 @@ def _build_verdict(escrow_id: str, llm_output: dict) -> Verdict:
 # ---------------------------------------------------------------------------
 
 
-def _execute_resolution(escrow_id: str, resolution: Resolution) -> dict:
+def _execute_resolution(
+    escrow_id: str,
+    resolution: Resolution,
+    provenance_result: dict | None = None,
+) -> dict:
     """Call POST /exchange/resolve on the exchange as the operator using the SDK."""
     from a2a_settlement_mediator.evidence import _get_sdk_client
 
     client = _get_sdk_client()
-    return client.resolve_escrow(escrow_id=escrow_id, resolution=resolution.value)
+    return client.resolve_escrow(
+        escrow_id=escrow_id,
+        resolution=resolution.value,
+        provenance_result=provenance_result,
+    )
 
 
 def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
@@ -170,15 +185,62 @@ def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_provenance_verification(evidence) -> ProvenanceResult | None:
+    """Run provenance verification if the escrow has provenance data."""
+    provenance = evidence.escrow.provenance
+    if not provenance:
+        return None
+
+    tier = evidence.escrow.required_attestation_level or provenance.get(
+        "attestation_level", "self_declared"
+    )
+
+    # Auto-upgrade to verifiable tier for high-value escrows
+    if tier != "verifiable" and evidence.escrow.amount >= settings.provenance_verifiable_threshold:
+        tier = "verifiable"
+
+    verifier = ProvenanceVerifier(spot_check_rate=settings.provenance_spot_check_rate)
+
+    try:
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(
+            verifier.verify(
+                provenance=provenance,
+                deliverable_content=evidence.escrow.delivered_content,
+                tier=tier,
+                escrow_created_at=evidence.escrow.created_at,
+            )
+        )
+        loop.close()
+        logger.info(
+            "Provenance verification for escrow %s: verified=%s confidence=%.2f flags=%s",
+            evidence.escrow.escrow_id,
+            result.verified,
+            result.confidence,
+            result.flags,
+        )
+        return result
+    except Exception as exc:
+        logger.error("Provenance verification failed: %s", exc)
+        return ProvenanceResult(
+            verified=False,
+            tier=tier,
+            confidence=0.0,
+            flags=[f"verification_error:{exc}"],
+            recommendation="flag",
+        )
+
+
 def mediate(escrow_id: str) -> AuditRecord:
     """Run the full mediation pipeline for a disputed escrow.
 
     Steps:
     1. Collect evidence from the exchange
-    2. Serialize and send to LLM for evaluation
-    3. Parse verdict and apply confidence threshold
-    4. Auto-resolve if confident, escalate otherwise
-    5. Return full audit record
+    2. Verify provenance (if present)
+    3. Serialize and send to LLM for evaluation
+    4. Apply confidence threshold
+    5. Auto-resolve if confident, escalate otherwise
+    6. Return full audit record
 
     Returns:
         AuditRecord with complete mediation trace.
@@ -189,7 +251,13 @@ def mediate(escrow_id: str) -> AuditRecord:
     evidence = collect_evidence(escrow_id)
     evidence_json = evidence.model_dump_json(indent=2)
 
-    # 2. Evaluate via LLM
+    # 2. Verify provenance
+    provenance_result = _run_provenance_verification(evidence)
+    provenance_result_json = (
+        provenance_result.model_dump_json(indent=2) if provenance_result else None
+    )
+
+    # 3. Evaluate via LLM
     exchange_response = None
     error = None
     prompt_tokens = 0
@@ -197,7 +265,9 @@ def mediate(escrow_id: str) -> AuditRecord:
     latency_ms = 0
 
     try:
-        llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(evidence_json)
+        llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
+            evidence_json, provenance_result_json
+        )
         verdict = _build_verdict(escrow_id, llm_output)
     except json.JSONDecodeError as exc:
         logger.error("Failed to parse LLM response as JSON: %s", exc)
@@ -218,11 +288,15 @@ def mediate(escrow_id: str) -> AuditRecord:
         )
         error = str(exc)
 
-    # 3. Execute or escalate
+    # 4. Execute or escalate
+    provenance_result_dict = provenance_result.model_dump() if provenance_result else None
+
     if verdict.outcome in (VerdictOutcome.AUTO_RELEASE, VerdictOutcome.AUTO_REFUND):
         assert verdict.resolution is not None
         try:
-            exchange_response = _execute_resolution(escrow_id, verdict.resolution)
+            exchange_response = _execute_resolution(
+                escrow_id, verdict.resolution, provenance_result_dict
+            )
             logger.info(
                 "Auto-resolved escrow %s → %s (confidence: %.0f%%)",
                 escrow_id,
@@ -242,11 +316,12 @@ def mediate(escrow_id: str) -> AuditRecord:
         )
         _notify_escalation(verdict, evidence_json)
 
-    # 4. Build audit record
+    # 5. Build audit record
     audit = AuditRecord(
         escrow_id=escrow_id,
         evidence=evidence,
         verdict=verdict,
+        provenance_result=provenance_result,
         llm_model=settings.llm_model,
         llm_prompt_tokens=prompt_tokens,
         llm_completion_tokens=completion_tokens,

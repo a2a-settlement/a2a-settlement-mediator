@@ -206,7 +206,7 @@ class TestMediate:
 
         assert audit.verdict.outcome == VerdictOutcome.AUTO_REFUND
         assert audit.verdict.confidence == 0.93
-        mock_resolve.assert_called_once_with("esc-001", Resolution.REFUND)
+        mock_resolve.assert_called_once_with("esc-001", Resolution.REFUND, None)
         assert audit.llm_latency_ms == 850
 
     @patch("a2a_settlement_mediator.mediator._notify_escalation")

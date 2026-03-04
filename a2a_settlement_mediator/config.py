@@ -72,6 +72,15 @@ class MediatorSettings:
     )
     execution_callback_url: str = os.getenv("MEDIATOR_EXECUTION_CALLBACK_URL", "")
 
+    # --- Provenance verification ---
+    # Rate at which Tier 2 (signed) transactions are spot-checked via endpoint re-fetch.
+    provenance_spot_check_rate: float = _get_float("MEDIATOR_PROVENANCE_SPOT_CHECK_RATE", 0.10)
+    # Escrow amount threshold above which Tier 3 (verifiable) is auto-triggered.
+    provenance_verifiable_threshold: int = _get_int(
+        "MEDIATOR_PROVENANCE_VERIFIABLE_THRESHOLD",
+        1000,
+    )
+
     # --- Ingestion limits (Context Bomb mitigation) ---
     # Maximum length of the transcript_hash field (hex chars). SHA-256 = 64.
     max_transcript_hash_length: int = _get_int("MEDIATOR_MAX_TRANSCRIPT_HASH_LENGTH", 128)

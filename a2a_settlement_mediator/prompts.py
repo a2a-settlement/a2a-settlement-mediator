@@ -33,6 +33,12 @@ Evaluate each dispute by weighing these factors:
 5. **Proportionality** — Is the escrow amount proportional to the task? \
    Does the dispute seem economically motivated vs. quality-motivated?
 
+6. **Provenance Attestation** — If provenance verification results are included, \
+   consider whether the data sources claimed by the provider are credible. \
+   A provenance failure alone does not justify refund — weigh it alongside \
+   deliverable quality. Fabricated sources with poor deliverables strongly \
+   favor refund. Legitimate sources with a quality dispute favor the provider.
+
 ## Decision Outcomes
 
 - **RELEASE** — Provider delivered satisfactorily. Release escrowed tokens to provider.
@@ -59,15 +65,27 @@ You MUST respond with ONLY a JSON object (no markdown fences, no preamble):
 """
 
 
-def build_evaluation_prompt(evidence_json: str) -> str:
+def build_evaluation_prompt(
+    evidence_json: str,
+    provenance_result_json: str | None = None,
+) -> str:
     """Build the user-turn prompt with the evidence bundle injected."""
+    provenance_section = ""
+    if provenance_result_json:
+        provenance_section = f"""
+## Provenance Verification Result
+
+{provenance_result_json}
+
+"""
+
     return f"""\
 Evaluate the following disputed escrow and render a verdict.
 
 ## Evidence Bundle
 
 {evidence_json}
-
+{provenance_section}\
 ## Instructions
 
 1. Examine the escrow details, deliverables, acceptance criteria, and dispute reason.
@@ -76,5 +94,7 @@ Evaluate the following disputed escrow and render a verdict.
 4. If no deliverables or acceptance criteria were defined, note this as a factor — \
    vague agreements favor the provider if work was attempted, or the requester if \
    there's no evidence of any work.
-5. Respond with ONLY the JSON verdict object.
+5. If provenance verification results are present, factor them into your assessment. \
+   Provenance failure is a signal of potential fabrication but not a standalone verdict.
+6. Respond with ONLY the JSON verdict object.
 """

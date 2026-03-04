@@ -67,6 +67,10 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
         task_id=escrow_data.get("task_id"),
         task_type=escrow_data.get("task_type"),
         deliverables=deliverables,
+        required_attestation_level=escrow_data.get("required_attestation_level"),
+        delivered_content=escrow_data.get("delivered_content"),
+        provenance=escrow_data.get("provenance"),
+        delivered_at=escrow_data.get("delivered_at"),
         created_at=escrow_data.get("created_at"),
         expires_at=escrow_data.get("expires_at"),
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -47,6 +48,10 @@ class EscrowEvidence(BaseModel):
     task_id: str | None = None
     task_type: str | None = None
     deliverables: list[Deliverable] = []
+    required_attestation_level: str | None = None
+    delivered_content: str | None = None
+    provenance: dict | None = None
+    delivered_at: datetime | None = None
     created_at: datetime | None = None
     expires_at: datetime | None = None
 
@@ -72,6 +77,21 @@ class EvidenceBundle(BaseModel):
     requester_recent_disputes: int = 0
     provider_recent_disputes: int = 0
     collected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Provenance verification result
+# ---------------------------------------------------------------------------
+
+
+class ProvenanceResult(BaseModel):
+    """Result of provenance verification by the mediator."""
+
+    verified: bool
+    tier: Literal["self_declared", "signed", "verifiable"]
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    flags: list[str] = []
+    recommendation: Literal["approve", "flag", "reject"]
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +122,7 @@ class AuditRecord(BaseModel):
     escrow_id: str
     evidence: EvidenceBundle
     verdict: Verdict
+    provenance_result: ProvenanceResult | None = None
     llm_model: str
     llm_prompt_tokens: int = 0
     llm_completion_tokens: int = 0
