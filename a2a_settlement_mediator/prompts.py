@@ -39,6 +39,13 @@ Evaluate each dispute by weighing these factors:
    deliverable quality. Fabricated sources with poor deliverables strongly \
    favor refund. Legitimate sources with a quality dispute favor the provider.
 
+7. **Web Grounding Evidence** — If web grounding metadata is present, the \
+   provider's deliverable was verified against live web sources before \
+   submission. Evaluate whether the grounding is meaningful: high coverage \
+   (>50%) with diverse sources (multiple domains) strengthens the provider's \
+   position. Low coverage or single-source grounding is a weaker signal. \
+   Grounding evidence is additive — its absence does not penalize the provider.
+
 ## Decision Outcomes
 
 - **RELEASE** — Provider delivered satisfactorily. Release escrowed tokens to provider.
@@ -68,14 +75,39 @@ You MUST respond with ONLY a JSON object (no markdown fences, no preamble):
 def build_evaluation_prompt(
     evidence_json: str,
     provenance_result_json: str | None = None,
+    grounding_summary: dict | None = None,
 ) -> str:
-    """Build the user-turn prompt with the evidence bundle injected."""
+    """Build the user-turn prompt with the evidence bundle injected.
+
+    Args:
+        evidence_json: Serialised evidence bundle.
+        provenance_result_json: Optional serialised provenance result.
+        grounding_summary: Optional grounding assessment dict from
+            ``ProvenanceVerifier._evaluate_grounding``.
+    """
     provenance_section = ""
     if provenance_result_json:
         provenance_section = f"""
 ## Provenance Verification Result
 
 {provenance_result_json}
+
+"""
+
+    grounding_section = ""
+    if grounding_summary:
+        src_count = grounding_summary.get("source_count", 0)
+        coverage = grounding_summary.get("coverage", 0)
+        domain_count = grounding_summary.get("domain_count", 0)
+        flags = grounding_summary.get("flags", [])
+        grounding_section = f"""
+## Web Grounding Evidence
+
+The provider's deliverable was grounded against live web sources:
+- **Web sources cited**: {src_count}
+- **Text coverage**: {coverage:.0%} of deliverable backed by sources
+- **Source diversity**: {domain_count} distinct domain(s)
+- **Assessment flags**: {", ".join(flags) if flags else "none"}
 
 """
 
@@ -86,6 +118,7 @@ Evaluate the following disputed escrow and render a verdict.
 
 {evidence_json}
 {provenance_section}\
+{grounding_section}\
 ## Instructions
 
 1. Examine the escrow details, deliverables, acceptance criteria, and dispute reason.
@@ -96,5 +129,8 @@ Evaluate the following disputed escrow and render a verdict.
    there's no evidence of any work.
 5. If provenance verification results are present, factor them into your assessment. \
    Provenance failure is a signal of potential fabrication but not a standalone verdict.
-6. Respond with ONLY the JSON verdict object.
+6. If web grounding evidence is present, assess whether the cited sources are \
+   authoritative and whether coverage is sufficient for the claims made. \
+   Grounding strengthens the provider's case but its absence is neutral.
+7. Respond with ONLY the JSON verdict object.
 """

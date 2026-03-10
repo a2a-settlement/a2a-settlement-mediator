@@ -44,12 +44,13 @@ litellm.suppress_debug_info = True
 def _call_llm(
     evidence_json: str,
     provenance_result_json: str | None = None,
+    grounding_summary: dict | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
     Returns: (parsed_verdict_dict, prompt_tokens, completion_tokens, latency_ms)
     """
-    user_prompt = build_evaluation_prompt(evidence_json, provenance_result_json)
+    user_prompt = build_evaluation_prompt(evidence_json, provenance_result_json, grounding_summary)
 
     t0 = time.monotonic()
     response = litellm.completion(
@@ -257,6 +258,15 @@ def mediate(escrow_id: str) -> AuditRecord:
         provenance_result.model_dump_json(indent=2) if provenance_result else None
     )
 
+    # 2b. Extract grounding summary if present
+    grounding_summary = None
+    provenance = evidence.escrow.provenance
+    if provenance and provenance.get("grounding_metadata"):
+        grounding_summary = ProvenanceVerifier._evaluate_grounding(
+            provenance["grounding_metadata"],
+            evidence.escrow.delivered_content,
+        )
+
     # 3. Evaluate via LLM
     exchange_response = None
     error = None
@@ -266,7 +276,7 @@ def mediate(escrow_id: str) -> AuditRecord:
 
     try:
         llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
-            evidence_json, provenance_result_json
+            evidence_json, provenance_result_json, grounding_summary
         )
         verdict = _build_verdict(escrow_id, llm_output)
     except json.JSONDecodeError as exc:

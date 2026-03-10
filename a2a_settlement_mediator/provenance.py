@@ -46,19 +46,32 @@ class ProvenanceVerifier:
         escrow_created_at: datetime | None = None,
     ) -> ProvenanceResult:
         if tier == "self_declared":
-            return await self.verify_self_declared(
+            result = await self.verify_self_declared(
                 provenance,
                 deliverable_content,
                 escrow_created_at,
             )
         elif tier == "signed":
-            return await self.verify_signed(
+            result = await self.verify_signed(
                 provenance,
                 deliverable_content,
                 escrow_created_at,
             )
         else:
-            return await self.verify_verifiable(provenance, deliverable_content, escrow_created_at)
+            result = await self.verify_verifiable(
+                provenance, deliverable_content, escrow_created_at
+            )
+
+        grounding_meta = provenance.get("grounding_metadata")
+        if grounding_meta:
+            assessment = self._evaluate_grounding(grounding_meta, deliverable_content)
+            result.flags.extend(assessment.get("flags", []))
+            boost = assessment.get("confidence_boost", 0.0)
+            result.confidence = min(1.0, result.confidence + boost)
+            if assessment.get("recommendation") == "approve" and result.recommendation == "flag":
+                result.recommendation = "approve"
+
+        return result
 
     async def verify_self_declared(
         self,
@@ -278,6 +291,101 @@ class ProvenanceVerifier:
             flags=[],
             recommendation="approve",
         )
+
+    # ------------------------------------------------------------------
+    # Grounding evaluation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _evaluate_grounding(
+        grounding_metadata: dict[str, Any],
+        deliverable_content: str | None = None,
+    ) -> dict[str, Any]:
+        """Score web grounding quality and return an assessment dict.
+
+        Returns:
+            Dict with ``flags``, ``confidence_boost``, ``recommendation``,
+            ``source_count``, ``coverage``, ``domain_count``.
+        """
+        flags: list[str] = []
+        chunks = grounding_metadata.get("chunks") or []
+        supports = grounding_metadata.get("supports") or []
+        coverage = grounding_metadata.get("coverage")
+
+        source_count = len(chunks)
+        if source_count == 0:
+            flags.append("grounding_no_chunks")
+            return {
+                "flags": flags,
+                "confidence_boost": 0.0,
+                "recommendation": "flag",
+                "source_count": 0,
+                "coverage": 0.0,
+                "domain_count": 0,
+            }
+
+        domains: set[str] = set()
+        for chunk in chunks:
+            uri = chunk.get("uri", "")
+            try:
+                from urllib.parse import urlparse
+
+                netloc = urlparse(uri).netloc
+                if netloc:
+                    domains.add(netloc)
+            except Exception:
+                pass
+        domain_count = len(domains)
+
+        if coverage is None and deliverable_content and supports:
+            text_len = len(deliverable_content)
+            covered = bytearray(text_len)
+            for sup in supports:
+                seg = sup.get("segment", {})
+                s = max(0, min(seg.get("start_index", 0), text_len))
+                e = max(s, min(seg.get("end_index", 0), text_len))
+                for i in range(s, e):
+                    covered[i] = 1
+            coverage = sum(covered) / text_len if text_len else 0.0
+
+        coverage = coverage or 0.0
+
+        for sup in supports:
+            for idx in sup.get("chunk_indices", []):
+                if idx < 0 or idx >= source_count:
+                    flags.append("grounding_invalid_chunk_index")
+                    break
+
+        if domain_count < 2:
+            flags.append("grounding_single_domain")
+        if coverage < 0.3:
+            flags.append("grounding_low_coverage")
+
+        boost = 0.0
+        recommendation = "flag"
+
+        if coverage >= 0.5 and domain_count >= 2:
+            boost = 0.15
+            recommendation = "approve"
+            flags.append("grounding_strong")
+        elif coverage >= 0.5:
+            boost = 0.10
+            recommendation = "approve"
+            flags.append("grounding_adequate")
+        elif coverage >= 0.3:
+            boost = 0.05
+            flags.append("grounding_partial")
+        else:
+            flags.append("grounding_weak")
+
+        return {
+            "flags": flags,
+            "confidence_boost": boost,
+            "recommendation": recommendation,
+            "source_count": source_count,
+            "coverage": round(coverage, 4),
+            "domain_count": domain_count,
+        }
 
     # ------------------------------------------------------------------
     # Helpers
