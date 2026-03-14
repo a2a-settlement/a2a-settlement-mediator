@@ -51,6 +51,7 @@ class EscrowEvidence(BaseModel):
     required_attestation_level: str | None = None
     delivered_content: str | None = None
     provenance: dict | None = None
+    vi_credential_chain: dict | None = None
     delivered_at: datetime | None = None
     created_at: datetime | None = None
     expires_at: datetime | None = None

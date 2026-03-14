@@ -46,6 +46,21 @@ Evaluate each dispute by weighing these factors:
    position. Low coverage or single-source grounding is a weaker signal. \
    Grounding evidence is additive — its absence does not penalize the provider.
 
+8. **Verifiable Intent (VI) Authorization Chain** — If a VI credential chain \
+   is present, evaluate whether the agent's actions fell within the user's \
+   cryptographically bound constraints. Key signals: \
+   - A valid chain with L3 values satisfying L2 constraints is strong evidence \
+     the agent acted within delegated authority (favors provider). \
+   - A chain showing constraint violations (amount exceeded, unauthorized \
+     merchant, disallowed items) is strong evidence of scope overreach \
+     (favors requester). \
+   - The VI chain proves authorization, not delivery quality — a valid chain \
+     does not mean the work was satisfactory, only that the agent was \
+     authorized to attempt it. Weigh alongside deliverable completeness. \
+   - If the chain is in autonomous mode (L3a + L3b present), check that \
+     fulfillment values match the L2 mandate constraints. \
+   - VI chain absence is neutral — not all escrows carry VI credentials.
+
 ## Decision Outcomes
 
 - **RELEASE** — Provider delivered satisfactorily. Release escrowed tokens to provider.
@@ -76,6 +91,7 @@ def build_evaluation_prompt(
     evidence_json: str,
     provenance_result_json: str | None = None,
     grounding_summary: dict | None = None,
+    vi_chain_summary: dict | None = None,
 ) -> str:
     """Build the user-turn prompt with the evidence bundle injected.
 
@@ -84,6 +100,7 @@ def build_evaluation_prompt(
         provenance_result_json: Optional serialised provenance result.
         grounding_summary: Optional grounding assessment dict from
             ``ProvenanceVerifier._evaluate_grounding``.
+        vi_chain_summary: Optional VI credential chain verification summary.
     """
     provenance_section = ""
     if provenance_result_json:
@@ -111,6 +128,29 @@ The provider's deliverable was grounded against live web sources:
 
 """
 
+    vi_section = ""
+    if vi_chain_summary:
+        mode = vi_chain_summary.get("mode", "unknown")
+        chain_present = vi_chain_summary.get("chain_present", False)
+        has_l3 = vi_chain_summary.get("has_l3", False)
+        structural_valid = vi_chain_summary.get("structural_valid", False)
+        flags = vi_chain_summary.get("flags", [])
+        vi_section = f"""
+## Verifiable Intent (VI) Authorization Chain
+
+A VI credential chain is attached to this escrow:
+- **Mode**: {mode}
+- **Chain present**: {chain_present}
+- **L3 fulfillment credentials**: {"present (agent proved constraint satisfaction)"
+ if has_l3 else "absent (immediate mode or not provided)"}
+- **Structural integrity**: {"valid" if structural_valid else "could not be fully verified"}
+- **Assessment flags**: {", ".join(flags) if flags else "none"}
+
+The VI chain proves the agent was cryptographically authorized by the user. \
+Evaluate whether the agent's actions stayed within the delegated constraints.
+
+"""
+
     return f"""\
 Evaluate the following disputed escrow and render a verdict.
 
@@ -119,6 +159,7 @@ Evaluate the following disputed escrow and render a verdict.
 {evidence_json}
 {provenance_section}\
 {grounding_section}\
+{vi_section}\
 ## Instructions
 
 1. Examine the escrow details, deliverables, acceptance criteria, and dispute reason.
@@ -132,5 +173,9 @@ Evaluate the following disputed escrow and render a verdict.
 6. If web grounding evidence is present, assess whether the cited sources are \
    authoritative and whether coverage is sufficient for the claims made. \
    Grounding strengthens the provider's case but its absence is neutral.
-7. Respond with ONLY the JSON verdict object.
+7. If a VI authorization chain is present, evaluate whether the agent acted within \
+   the user's delegated constraints. A valid chain with L3 fulfillment is strong \
+   evidence the agent was authorized; constraint violations favor the requester. \
+   VI proves authorization, not delivery quality — weigh alongside other factors.
+8. Respond with ONLY the JSON verdict object.
 """

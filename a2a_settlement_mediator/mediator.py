@@ -45,12 +45,15 @@ def _call_llm(
     evidence_json: str,
     provenance_result_json: str | None = None,
     grounding_summary: dict | None = None,
+    vi_chain_summary: dict | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
     Returns: (parsed_verdict_dict, prompt_tokens, completion_tokens, latency_ms)
     """
-    user_prompt = build_evaluation_prompt(evidence_json, provenance_result_json, grounding_summary)
+    user_prompt = build_evaluation_prompt(
+        evidence_json, provenance_result_json, grounding_summary, vi_chain_summary
+    )
 
     t0 = time.monotonic()
     response = litellm.completion(
@@ -186,6 +189,71 @@ def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _evaluate_vi_chain(evidence) -> dict | None:
+    """Evaluate the VI credential chain attached to the escrow, if any.
+
+    Performs basic structural assessment (presence of layers, mode consistency)
+    without full SD-JWT cryptographic verification, which requires the issuer's
+    JWKS. Returns a summary dict for the LLM prompt, or None if no chain.
+    """
+    vi_chain = evidence.escrow.vi_credential_chain
+    if not vi_chain:
+        return None
+
+    mode = vi_chain.get("mode", "unknown")
+    has_l1 = bool(vi_chain.get("l1_sd_jwt"))
+    has_l2 = bool(vi_chain.get("l2_kb_sd_jwt"))
+    has_l3a = bool(vi_chain.get("l3a_kb_sd_jwt"))
+    has_l3b = bool(vi_chain.get("l3b_kb_sd_jwt"))
+    has_l3 = has_l3a and has_l3b
+
+    flags: list[str] = []
+
+    if not has_l1:
+        flags.append("missing_l1_credential")
+    if not has_l2:
+        flags.append("missing_l2_mandate")
+
+    if mode == "autonomous":
+        if not has_l3:
+            flags.append("autonomous_mode_missing_l3")
+        if has_l3a and not has_l3b:
+            flags.append("l3a_present_but_l3b_missing")
+        elif has_l3b and not has_l3a:
+            flags.append("l3b_present_but_l3a_missing")
+    elif mode == "immediate":
+        if has_l3a or has_l3b:
+            flags.append("immediate_mode_unexpected_l3")
+
+    sd_hash_verified = vi_chain.get("sd_hash_verified", False)
+    structural_valid = has_l1 and has_l2 and not any(
+        f.startswith("missing_") for f in flags
+    )
+
+    if sd_hash_verified:
+        flags.append("sd_hash_chain_verified")
+    else:
+        flags.append("sd_hash_not_verified")
+
+    logger.info(
+        "VI chain assessment for escrow %s: mode=%s has_l3=%s structural=%s flags=%s",
+        evidence.escrow.escrow_id,
+        mode,
+        has_l3,
+        structural_valid,
+        flags,
+    )
+
+    return {
+        "chain_present": True,
+        "mode": mode,
+        "has_l3": has_l3,
+        "structural_valid": structural_valid,
+        "sd_hash_verified": sd_hash_verified,
+        "flags": flags,
+    }
+
+
 def _run_provenance_verification(evidence) -> ProvenanceResult | None:
     """Run provenance verification if the escrow has provenance data."""
     provenance = evidence.escrow.provenance
@@ -267,6 +335,9 @@ def mediate(escrow_id: str) -> AuditRecord:
             evidence.escrow.delivered_content,
         )
 
+    # 2c. Evaluate VI credential chain if present
+    vi_chain_summary = _evaluate_vi_chain(evidence)
+
     # 3. Evaluate via LLM
     exchange_response = None
     error = None
@@ -276,7 +347,7 @@ def mediate(escrow_id: str) -> AuditRecord:
 
     try:
         llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
-            evidence_json, provenance_result_json, grounding_summary
+            evidence_json, provenance_result_json, grounding_summary, vi_chain_summary
         )
         verdict = _build_verdict(escrow_id, llm_output)
     except json.JSONDecodeError as exc:
