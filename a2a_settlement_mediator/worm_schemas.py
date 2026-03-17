@@ -297,6 +297,38 @@ class SettlementProof(BaseModel):
     completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class AttestationLifecycleEvent(str, Enum):
+    """Attestation lifecycle events appended to the WORM audit trail."""
+
+    REVOCATION = "revocation"
+    RENEWAL = "renewal"
+    EXPIRATION = "expiration"
+    TTL_WARNING = "ttl_warning"
+
+
+class AttestationLifecycleRecord(BaseModel):
+    """WORM-appendable record for attestation lifecycle events (SEC 17a-4)."""
+
+    attestation_id: str
+    account_id: str
+    attestation_type: str
+    event: AttestationLifecycleEvent
+    reason: str | None = None
+    parent_attestation_id: str | None = None
+    fee_charged: int | None = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    payload_hash: str | None = None
+    schema_version: str = SCHEMA_VERSION
+
+    def compute_hash(self) -> str:
+        canonical = json.dumps(
+            self.model_dump(mode="json", exclude={"payload_hash"}),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+
 class ExecutionStatus(str, Enum):
     """Tracks whether the settlement mandate has been released to the execution engine."""
 

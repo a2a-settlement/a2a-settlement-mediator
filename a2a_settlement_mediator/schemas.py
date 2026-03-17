@@ -94,6 +94,8 @@ class EvidenceBundle(BaseModel):
     provider_recent_disputes: int = 0
     requester_evidence: list[StructuredEvidence] = []
     provider_evidence: list[StructuredEvidence] = []
+    requester_attestation_freshness: dict | None = None
+    provider_attestation_freshness: dict | None = None
     collected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

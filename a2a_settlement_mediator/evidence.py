@@ -34,6 +34,39 @@ def _get_sdk_client() -> SettlementExchangeClient:
     )
 
 
+def _check_attestation_freshness(
+    client: SettlementExchangeClient, account_id: str
+) -> dict | None:
+    """Check whether an agent's attestations are still valid (OCSP-style).
+
+    Returns a dict with freshness info, or None if the check is unavailable.
+    """
+    try:
+        resp = client._get(f"/exchange/attestations?account_id={account_id}&status=active&limit=10")
+        attestations = resp.get("attestations", [])
+        if not attestations:
+            return {"valid": True, "note": "no_attestations_found"}
+
+        flags = []
+        for att in attestations:
+            remaining = att.get("ttl_remaining_seconds")
+            att_type = att.get("attestation_type", "unknown")
+            status = att.get("status", "active")
+            if status != "active":
+                flags.append(f"{att_type}:{status}")
+            elif remaining is not None and remaining <= 0:
+                flags.append(f"{att_type}:expired")
+
+        return {
+            "valid": len(flags) == 0,
+            "flags": flags,
+            "attestation_count": len(attestations),
+        }
+    except Exception:
+        logger.warning("Attestation freshness check failed for %s", account_id)
+        return None
+
+
 def collect_evidence(escrow_id: str) -> EvidenceBundle:
     """Fetch all evidence for a disputed escrow from the exchange.
 
@@ -42,6 +75,7 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
     - Requester account (reputation, history)
     - Provider account (reputation, history)
     - Recent dispute counts for both parties
+    - Attestation freshness for both parties
     """
     client = _get_sdk_client()
 
@@ -87,6 +121,9 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
         client, escrow_id, escrow_data["requester_id"], escrow_data["provider_id"]
     )
 
+    requester_freshness = _check_attestation_freshness(client, escrow_data["requester_id"])
+    provider_freshness = _check_attestation_freshness(client, escrow_data["provider_id"])
+
     return EvidenceBundle(
         escrow=escrow_evidence,
         requester=requester,
@@ -95,6 +132,8 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
         provider_recent_disputes=provider_disputes,
         requester_evidence=requester_evidence,
         provider_evidence=provider_evidence,
+        requester_attestation_freshness=requester_freshness,
+        provider_attestation_freshness=provider_freshness,
         collected_at=datetime.now(timezone.utc),
     )
 

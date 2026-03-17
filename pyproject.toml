@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "a2a-settlement-mediator"
-version = "0.3.0"
+version = "0.4.0"
 description = "AI-powered dispute resolution and SEC 17a-4 WORM-compliant settlement for the A2A Settlement Exchange."
 readme = "README.md"
 license = "MIT"
