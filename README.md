@@ -1,5 +1,8 @@
 # A2A Settlement Mediator
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
+
 AI-powered dispute resolution for the [A2A Settlement Exchange](https://github.com/a2a-settlement/a2a-settlement). Autonomously evaluates disputed escrows and resolves clear-cut cases, escalating ambiguous disputes to human operators.
 
 ## How It Works
@@ -246,6 +249,10 @@ a2a_settlement_mediator/
 | [a2a-settlement-auth](https://github.com/a2a-settlement/a2a-settlement-auth) | OAuth scopes — `settlement:dispute:resolve` for mediator operators |
 | [a2a-settlement-dashboard](https://github.com/a2a-settlement/a2a-settlement-dashboard) | Human oversight — escalation targets |
 | [a2a-settlement-mcp](https://github.com/a2a-settlement/a2a-settlement-mcp) | MCP server |
+| [settlebridge-ai](https://github.com/a2a-settlement/settlebridge-ai) | SettleBridge Gateway — trust/policy enforcement |
+| [mcp-trust-gateway](https://github.com/a2a-settlement/mcp-trust-gateway) | MCP trust layer above OAuth |
+| [otel-agent-provenance](https://github.com/a2a-settlement/otel-agent-provenance) | OpenTelemetry provenance conventions |
+| [a2a-federation-rfc](https://github.com/a2a-settlement/a2a-federation-rfc) | Federation protocol specification |
 | [langgraph-a2a-settlement](https://github.com/a2a-settlement/langgraph-a2a-settlement) | LangGraph integration |
 | [crewai-a2a-settlement](https://github.com/a2a-settlement/crewai-a2a-settlement) | CrewAI integration — WORM pipeline ingests CrewAI transcripts |
 | [litellm-a2a-settlement](https://github.com/a2a-settlement/litellm-a2a-settlement) | LiteLLM integration |
