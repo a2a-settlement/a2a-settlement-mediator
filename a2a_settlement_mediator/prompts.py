@@ -46,7 +46,26 @@ Evaluate each dispute by weighing these factors:
    position. Low coverage or single-source grounding is a weaker signal. \
    Grounding evidence is additive — its absence does not penalize the provider.
 
-8. **Verifiable Intent (VI) Authorization Chain** — If a VI credential chain \
+8. **Structured Evidence Submissions** — If either party submitted structured \
+   evidence during the evidence window, evaluate it by type: \
+   - **Compute**: Execution logs, exit codes, runtime metrics. Zero exit codes \
+     and clean logs favor the provider. Crash logs or timeout evidence favor \
+     the requester. \
+   - **Content**: Code diffs, quality scores, test results. Passing tests and \
+     clean diffs favor the provider. Failing tests favor the requester. \
+   - **Service**: Uptime metrics, SLA data, monitoring alerts. Metrics within \
+     SLA favor the provider. Downtime or breached thresholds favor the requester. \
+   - **Bounty**: Test pass rates, benchmark scores. Quantitative results are \
+     weighed against the acceptance criteria percentage thresholds. \
+   - **Third-party attestation**: Cryptographically signed attestations from \
+     oracles or monitoring tools carry high weight. Verify the attestor is \
+     identified and the signature is present. Unsigned third-party claims are \
+     treated as self-declared evidence. \
+   Missing evidence from a party that was expected to submit (the respondent) \
+   is a strong negative signal. If both parties submitted evidence, weigh the \
+   structured proof against the free-text dispute reason.
+
+9. **Verifiable Intent (VI) Authorization Chain** — If a VI credential chain \
    is present, evaluate whether the agent's actions fell within the user's \
    cryptographically bound constraints. Key signals: \
    - A valid chain with L3 values satisfying L2 constraints is strong evidence \
@@ -92,6 +111,8 @@ def build_evaluation_prompt(
     provenance_result_json: str | None = None,
     grounding_summary: dict | None = None,
     vi_chain_summary: dict | None = None,
+    requester_evidence_json: str | None = None,
+    provider_evidence_json: str | None = None,
 ) -> str:
     """Build the user-turn prompt with the evidence bundle injected.
 
@@ -101,6 +122,8 @@ def build_evaluation_prompt(
         grounding_summary: Optional grounding assessment dict from
             ``ProvenanceVerifier._evaluate_grounding``.
         vi_chain_summary: Optional VI credential chain verification summary.
+        requester_evidence_json: Optional serialised requester evidence submissions.
+        provider_evidence_json: Optional serialised provider evidence submissions.
     """
     provenance_section = ""
     if provenance_result_json:
@@ -151,6 +174,24 @@ Evaluate whether the agent's actions stayed within the delegated constraints.
 
 """
 
+    requester_evidence_section = ""
+    if requester_evidence_json:
+        requester_evidence_section = f"""
+## Requester Structured Evidence
+
+{requester_evidence_json}
+
+"""
+
+    provider_evidence_section = ""
+    if provider_evidence_json:
+        provider_evidence_section = f"""
+## Provider Structured Evidence
+
+{provider_evidence_json}
+
+"""
+
     return f"""\
 Evaluate the following disputed escrow and render a verdict.
 
@@ -160,6 +201,8 @@ Evaluate the following disputed escrow and render a verdict.
 {provenance_section}\
 {grounding_section}\
 {vi_section}\
+{requester_evidence_section}\
+{provider_evidence_section}\
 ## Instructions
 
 1. Examine the escrow details, deliverables, acceptance criteria, and dispute reason.
@@ -177,5 +220,9 @@ Evaluate the following disputed escrow and render a verdict.
    the user's delegated constraints. A valid chain with L3 fulfillment is strong \
    evidence the agent was authorized; constraint violations favor the requester. \
    VI proves authorization, not delivery quality — weigh alongside other factors.
-8. Respond with ONLY the JSON verdict object.
+8. If structured evidence submissions are present from either party, evaluate them \
+   according to their type (compute, content, service, bounty, third_party_attestation). \
+   Third-party attestations with valid signatures carry high evidentiary weight. \
+   Missing evidence from the respondent is a strong negative signal.
+9. Respond with ONLY the JSON verdict object.
 """

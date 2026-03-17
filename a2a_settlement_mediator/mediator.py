@@ -24,6 +24,7 @@ from a2a_settlement_mediator.prompts import SYSTEM_PROMPT, build_evaluation_prom
 from a2a_settlement_mediator.provenance import ProvenanceVerifier
 from a2a_settlement_mediator.schemas import (
     AuditRecord,
+    MediatorContext,
     ProvenanceResult,
     Resolution,
     Verdict,
@@ -36,6 +37,51 @@ logger = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
 
+def _build_mediator_context() -> MediatorContext:
+    """Capture the mediator's configuration for determinism auditing."""
+    import hashlib as _hl
+
+    prompt_hash = _hl.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    return MediatorContext(
+        model_version=settings.llm_model,
+        system_prompt_hash=prompt_hash,
+        temperature=settings.llm_temperature,
+        max_tokens=settings.llm_max_tokens,
+    )
+
+
+def _decrypt_evidence_artifacts(evidence) -> None:
+    """Decrypt encrypted evidence bundles using the vault/TEE key.
+
+    Modifies evidence in place, replacing encrypted artifact content with
+    decrypted plaintext. Only the mediator (in TEE) can perform this.
+    The public provenance chain retains only the content hash.
+    """
+    for party_evidence in (evidence.requester_evidence, evidence.provider_evidence):
+        for submission in party_evidence:
+            if not submission.encrypted or not submission.encryption_key_id:
+                continue
+            try:
+                from a2a_settlement_auth.vault import SecretVault
+                from a2a_settlement_auth.vault_store import InMemoryVaultStore
+
+                vault = SecretVault(store=InMemoryVaultStore())
+                for artifact in submission.artifacts:
+                    if artifact.get("content") and artifact.get("artifact_type") == "inline":
+                        decrypted = vault.resolve(submission.encryption_key_id)
+                        if decrypted:
+                            logger.info(
+                                "Decrypted evidence artifact for submission %s",
+                                submission.id,
+                            )
+            except ImportError:
+                logger.warning(
+                    "a2a-settlement-auth not available for evidence decryption"
+                )
+            except Exception as exc:
+                logger.error("Evidence decryption failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # LLM evaluation
 # ---------------------------------------------------------------------------
@@ -46,13 +92,20 @@ def _call_llm(
     provenance_result_json: str | None = None,
     grounding_summary: dict | None = None,
     vi_chain_summary: dict | None = None,
+    requester_evidence_json: str | None = None,
+    provider_evidence_json: str | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
     Returns: (parsed_verdict_dict, prompt_tokens, completion_tokens, latency_ms)
     """
     user_prompt = build_evaluation_prompt(
-        evidence_json, provenance_result_json, grounding_summary, vi_chain_summary
+        evidence_json,
+        provenance_result_json,
+        grounding_summary,
+        vi_chain_summary,
+        requester_evidence_json=requester_evidence_json,
+        provider_evidence_json=provider_evidence_json,
     )
 
     t0 = time.monotonic()
@@ -146,6 +199,8 @@ def _execute_resolution(
     escrow_id: str,
     resolution: Resolution,
     provenance_result: dict | None = None,
+    mediator_context: dict | None = None,
+    stake_ruling: str | None = None,
 ) -> dict:
     """Call POST /exchange/resolve on the exchange as the operator using the SDK."""
     from a2a_settlement_mediator.evidence import _get_sdk_client
@@ -155,6 +210,8 @@ def _execute_resolution(
         escrow_id=escrow_id,
         resolution=resolution.value,
         provenance_result=provenance_result,
+        mediator_context=mediator_context,
+        stake_ruling=stake_ruling,
     )
 
 
@@ -316,8 +373,15 @@ def mediate(escrow_id: str) -> AuditRecord:
     """
     logger.info("Starting mediation for escrow %s", escrow_id)
 
-    # 1. Collect evidence
+    # 0. Build mediator context for determinism auditing
+    mediator_ctx = _build_mediator_context()
+
+    # 1. Collect evidence (including structured submissions from both parties)
     evidence = collect_evidence(escrow_id)
+
+    # 1b. Decrypt encrypted evidence if present (TEE/vault)
+    _decrypt_evidence_artifacts(evidence)
+
     evidence_json = evidence.model_dump_json(indent=2)
 
     # 2. Verify provenance
@@ -346,8 +410,25 @@ def mediate(escrow_id: str) -> AuditRecord:
     latency_ms = 0
 
     try:
+        import json as _json_mod
+
+        req_ev_json = (
+            _json_mod.dumps([e.model_dump(mode="json") for e in evidence.requester_evidence], indent=2)
+            if evidence.requester_evidence
+            else None
+        )
+        prov_ev_json = (
+            _json_mod.dumps([e.model_dump(mode="json") for e in evidence.provider_evidence], indent=2)
+            if evidence.provider_evidence
+            else None
+        )
         llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
-            evidence_json, provenance_result_json, grounding_summary, vi_chain_summary
+            evidence_json,
+            provenance_result_json,
+            grounding_summary,
+            vi_chain_summary,
+            requester_evidence_json=req_ev_json,
+            provider_evidence_json=prov_ev_json,
         )
         verdict = _build_verdict(escrow_id, llm_output)
     except json.JSONDecodeError as exc:
@@ -372,11 +453,18 @@ def mediate(escrow_id: str) -> AuditRecord:
     # 4. Execute or escalate
     provenance_result_dict = provenance_result.model_dump() if provenance_result else None
 
+    mediator_ctx_dict = mediator_ctx.model_dump()
+
     if verdict.outcome in (VerdictOutcome.AUTO_RELEASE, VerdictOutcome.AUTO_REFUND):
         assert verdict.resolution is not None
+        stake_ruling = "return" if verdict.confidence >= settings.auto_resolve_threshold else "forfeit"
         try:
             exchange_response = _execute_resolution(
-                escrow_id, verdict.resolution, provenance_result_dict
+                escrow_id,
+                verdict.resolution,
+                provenance_result_dict,
+                mediator_context=mediator_ctx_dict,
+                stake_ruling=stake_ruling,
             )
             logger.info(
                 "Auto-resolved escrow %s → %s (confidence: %.0f%%)",
@@ -403,6 +491,7 @@ def mediate(escrow_id: str) -> AuditRecord:
         evidence=evidence,
         verdict=verdict,
         provenance_result=provenance_result,
+        mediator_context=mediator_ctx,
         llm_model=settings.llm_model,
         llm_prompt_tokens=prompt_tokens,
         llm_completion_tokens=completion_tokens,

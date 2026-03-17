@@ -18,6 +18,7 @@ from a2a_settlement_mediator.schemas import (
     Deliverable,
     EscrowEvidence,
     EvidenceBundle,
+    StructuredEvidence,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,12 +83,18 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
     requester_disputes = _count_recent_disputes(client, escrow_data["requester_id"])
     provider_disputes = _count_recent_disputes(client, escrow_data["provider_id"])
 
+    requester_evidence, provider_evidence = _fetch_structured_evidence(
+        client, escrow_id, escrow_data["requester_id"], escrow_data["provider_id"]
+    )
+
     return EvidenceBundle(
         escrow=escrow_evidence,
         requester=requester,
         provider=provider,
         requester_recent_disputes=requester_disputes,
         provider_recent_disputes=provider_disputes,
+        requester_evidence=requester_evidence,
+        provider_evidence=provider_evidence,
         collected_at=datetime.now(timezone.utc),
     )
 
@@ -116,3 +123,38 @@ def _count_recent_disputes(client: SettlementExchangeClient, account_id: str) ->
         except Exception:
             logger.warning("Failed to fetch %s escrows for dispute count", status)
     return count
+
+
+def _fetch_structured_evidence(
+    client: SettlementExchangeClient,
+    escrow_id: str,
+    requester_id: str,
+    provider_id: str,
+) -> tuple[list[StructuredEvidence], list[StructuredEvidence]]:
+    """Fetch structured evidence submissions from both parties."""
+    requester_evidence: list[StructuredEvidence] = []
+    provider_evidence: list[StructuredEvidence] = []
+
+    try:
+        data = client.list_evidence(escrow_id=escrow_id)
+        for item in data.get("evidence", []):
+            se = StructuredEvidence(
+                id=item["id"],
+                submitter_id=item["submitter_id"],
+                evidence_type=item.get("evidence_type", ""),
+                summary=item.get("summary", ""),
+                artifacts=item.get("artifacts", []),
+                encrypted=item.get("encrypted", False),
+                content_hash=item.get("content_hash", ""),
+                attestor_id=item.get("attestor_id"),
+                attestor_signature=item.get("attestor_signature"),
+                submitted_at=item.get("submitted_at"),
+            )
+            if se.submitter_id == requester_id:
+                requester_evidence.append(se)
+            elif se.submitter_id == provider_id:
+                provider_evidence.append(se)
+    except Exception:
+        logger.warning("Failed to fetch structured evidence for escrow %s", escrow_id)
+
+    return requester_evidence, provider_evidence

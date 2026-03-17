@@ -69,6 +69,21 @@ class AccountEvidence(BaseModel):
     total_spent: int = 0
 
 
+class StructuredEvidence(BaseModel):
+    """A structured evidence submission from one party."""
+
+    id: str
+    submitter_id: str
+    evidence_type: str
+    summary: str
+    artifacts: list[dict] = []
+    encrypted: bool = False
+    content_hash: str = ""
+    attestor_id: str | None = None
+    attestor_signature: str | None = None
+    submitted_at: datetime | None = None
+
+
 class EvidenceBundle(BaseModel):
     """All evidence the mediator collects before evaluating a dispute."""
 
@@ -77,6 +92,8 @@ class EvidenceBundle(BaseModel):
     provider: AccountEvidence
     requester_recent_disputes: int = 0
     provider_recent_disputes: int = 0
+    requester_evidence: list[StructuredEvidence] = []
+    provider_evidence: list[StructuredEvidence] = []
     collected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -117,6 +134,18 @@ class Verdict(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class MediatorContext(BaseModel):
+    """Snapshot of the mediator's configuration at time of adjudication.
+
+    Ensures the AI's ruling parameters are as auditable as the agents' evidence.
+    """
+
+    model_version: str
+    system_prompt_hash: str
+    temperature: float
+    max_tokens: int
+
+
 class AuditRecord(BaseModel):
     """Full audit trail for a mediation decision."""
 
@@ -124,6 +153,7 @@ class AuditRecord(BaseModel):
     evidence: EvidenceBundle
     verdict: Verdict
     provenance_result: ProvenanceResult | None = None
+    mediator_context: MediatorContext | None = None
     llm_model: str
     llm_prompt_tokens: int = 0
     llm_completion_tokens: int = 0
