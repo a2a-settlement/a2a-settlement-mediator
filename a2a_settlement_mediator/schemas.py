@@ -70,7 +70,7 @@ class AccountEvidence(BaseModel):
 
 
 class StructuredEvidence(BaseModel):
-    """A structured evidence submission from one party."""
+    """A structured evidence submission from one party or an oracle."""
 
     id: str
     submitter_id: str
@@ -81,6 +81,9 @@ class StructuredEvidence(BaseModel):
     content_hash: str = ""
     attestor_id: str | None = None
     attestor_signature: str | None = None
+    # "party" = requester/provider self-reported; "oracle" = registered oracle
+    source_type: str = "party"
+    oracle_id: str | None = None
     submitted_at: datetime | None = None
 
 
@@ -94,6 +97,7 @@ class EvidenceBundle(BaseModel):
     provider_recent_disputes: int = 0
     requester_evidence: list[StructuredEvidence] = []
     provider_evidence: list[StructuredEvidence] = []
+    oracle_evidence: list[StructuredEvidence] = []
     requester_attestation_freshness: dict | None = None
     provider_attestation_freshness: dict | None = None
     collected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

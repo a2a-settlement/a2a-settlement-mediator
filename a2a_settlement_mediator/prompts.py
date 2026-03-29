@@ -65,6 +65,22 @@ Evaluate each dispute by weighing these factors:
    is a strong negative signal. If both parties submitted evidence, weigh the \
    structured proof against the free-text dispute reason.
 
+10. **Oracle/Third-Party Corroboration** — Evidence with ``source_type="oracle"`` \
+    was submitted by a registered oracle account (a neutral third party verified \
+    by the exchange operator, not one of the disputing parties). Oracle evidence \
+    has significantly higher evidentiary weight than self-reported party evidence \
+    because it cannot be fabricated by either disputant: \
+    - Oracle evidence that corroborates one party's claims upgrades that party's \
+      position from "asserted" to "independently confirmed". \
+    - Conflicting oracle evidence (oracle says X, party says Y) strongly favors \
+      the oracle's account. \
+    - Multiple independent oracle submissions pointing the same direction should \
+      be treated as near-conclusive. \
+    - If oracle evidence is present, it typically raises your confidence level \
+      by 0.10–0.20 relative to a case with only self-reported evidence. \
+    - ``oracle_id`` identifies the specific registered oracle; treat oracles with \
+      signed ``attestor_signature`` as the highest tier of third-party evidence.
+
 9. **Verifiable Intent (VI) Authorization Chain** — If a VI credential chain \
    is present, evaluate whether the agent's actions fell within the user's \
    cryptographically bound constraints. Key signals: \
@@ -113,6 +129,7 @@ def build_evaluation_prompt(
     vi_chain_summary: dict | None = None,
     requester_evidence_json: str | None = None,
     provider_evidence_json: str | None = None,
+    oracle_evidence_json: str | None = None,
 ) -> str:
     """Build the user-turn prompt with the evidence bundle injected.
 
@@ -124,6 +141,8 @@ def build_evaluation_prompt(
         vi_chain_summary: Optional VI credential chain verification summary.
         requester_evidence_json: Optional serialised requester evidence submissions.
         provider_evidence_json: Optional serialised provider evidence submissions.
+        oracle_evidence_json: Optional serialised oracle/third-party evidence
+            submissions (source_type="oracle").
     """
     provenance_section = ""
     if provenance_result_json:
@@ -164,8 +183,11 @@ The provider's deliverable was grounded against live web sources:
 A VI credential chain is attached to this escrow:
 - **Mode**: {mode}
 - **Chain present**: {chain_present}
-- **L3 fulfillment credentials**: {"present (agent proved constraint satisfaction)"
- if has_l3 else "absent (immediate mode or not provided)"}
+- **L3 fulfillment credentials**: {
+            "present (agent proved constraint satisfaction)"
+            if has_l3
+            else "absent (immediate mode or not provided)"
+        }
 - **Structural integrity**: {"valid" if structural_valid else "could not be fully verified"}
 - **Assessment flags**: {", ".join(flags) if flags else "none"}
 
@@ -192,6 +214,20 @@ Evaluate whether the agent's actions stayed within the delegated constraints.
 
 """
 
+    oracle_evidence_section = ""
+    if oracle_evidence_json:
+        oracle_evidence_section = f"""
+## Oracle / Third-Party Evidence
+
+The following evidence was submitted by registered oracle accounts — neutral \
+third parties verified by the exchange operator. This evidence is independent \
+of both disputing parties and carries higher evidentiary weight than \
+self-reported party evidence.
+
+{oracle_evidence_json}
+
+"""
+
     return f"""\
 Evaluate the following disputed escrow and render a verdict.
 
@@ -201,6 +237,7 @@ Evaluate the following disputed escrow and render a verdict.
 {provenance_section}\
 {grounding_section}\
 {vi_section}\
+{oracle_evidence_section}\
 {requester_evidence_section}\
 {provider_evidence_section}\
 ## Instructions
@@ -224,5 +261,10 @@ Evaluate the following disputed escrow and render a verdict.
    according to their type (compute, content, service, bounty, third_party_attestation). \
    Third-party attestations with valid signatures carry high evidentiary weight. \
    Missing evidence from the respondent is a strong negative signal.
-9. Respond with ONLY the JSON verdict object.
+9. If oracle/third-party evidence is present, treat it as independent corroboration \
+   from a neutral source registered with the exchange. Weigh it above self-reported \
+   party evidence. An oracle with a signed attestor_signature at the highest trust \
+   tier. Multiple agreeing oracle submissions should be treated as near-conclusive. \
+   Adjust your confidence upward when oracle evidence corroborates one side's account.
+10. Respond with ONLY the JSON verdict object.
 """

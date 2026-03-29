@@ -75,9 +75,7 @@ def _decrypt_evidence_artifacts(evidence) -> None:
                                 submission.id,
                             )
             except ImportError:
-                logger.warning(
-                    "a2a-settlement-auth not available for evidence decryption"
-                )
+                logger.warning("a2a-settlement-auth not available for evidence decryption")
             except Exception as exc:
                 logger.error("Evidence decryption failed: %s", exc)
 
@@ -94,6 +92,7 @@ def _call_llm(
     vi_chain_summary: dict | None = None,
     requester_evidence_json: str | None = None,
     provider_evidence_json: str | None = None,
+    oracle_evidence_json: str | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
@@ -106,6 +105,7 @@ def _call_llm(
         vi_chain_summary,
         requester_evidence_json=requester_evidence_json,
         provider_evidence_json=provider_evidence_json,
+        oracle_evidence_json=oracle_evidence_json,
     )
 
     t0 = time.monotonic()
@@ -283,9 +283,7 @@ def _evaluate_vi_chain(evidence) -> dict | None:
             flags.append("immediate_mode_unexpected_l3")
 
     sd_hash_verified = vi_chain.get("sd_hash_verified", False)
-    structural_valid = has_l1 and has_l2 and not any(
-        f.startswith("missing_") for f in flags
-    )
+    structural_valid = has_l1 and has_l2 and not any(f.startswith("missing_") for f in flags)
 
     if sd_hash_verified:
         flags.append("sd_hash_chain_verified")
@@ -413,13 +411,22 @@ def mediate(escrow_id: str) -> AuditRecord:
         import json as _json_mod
 
         req_ev_json = (
-            _json_mod.dumps([e.model_dump(mode="json") for e in evidence.requester_evidence], indent=2)
+            _json_mod.dumps(
+                [e.model_dump(mode="json") for e in evidence.requester_evidence], indent=2
+            )
             if evidence.requester_evidence
             else None
         )
         prov_ev_json = (
-            _json_mod.dumps([e.model_dump(mode="json") for e in evidence.provider_evidence], indent=2)
+            _json_mod.dumps(
+                [e.model_dump(mode="json") for e in evidence.provider_evidence], indent=2
+            )
             if evidence.provider_evidence
+            else None
+        )
+        oracle_ev_json = (
+            _json_mod.dumps([e.model_dump(mode="json") for e in evidence.oracle_evidence], indent=2)
+            if evidence.oracle_evidence
             else None
         )
         llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
@@ -429,6 +436,7 @@ def mediate(escrow_id: str) -> AuditRecord:
             vi_chain_summary,
             requester_evidence_json=req_ev_json,
             provider_evidence_json=prov_ev_json,
+            oracle_evidence_json=oracle_ev_json,
         )
         verdict = _build_verdict(escrow_id, llm_output)
     except json.JSONDecodeError as exc:
@@ -457,7 +465,9 @@ def mediate(escrow_id: str) -> AuditRecord:
 
     if verdict.outcome in (VerdictOutcome.AUTO_RELEASE, VerdictOutcome.AUTO_REFUND):
         assert verdict.resolution is not None
-        stake_ruling = "return" if verdict.confidence >= settings.auto_resolve_threshold else "forfeit"
+        stake_ruling = (
+            "return" if verdict.confidence >= settings.auto_resolve_threshold else "forfeit"
+        )
         try:
             exchange_response = _execute_resolution(
                 escrow_id,

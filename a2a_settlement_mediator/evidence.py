@@ -34,9 +34,7 @@ def _get_sdk_client() -> SettlementExchangeClient:
     )
 
 
-def _check_attestation_freshness(
-    client: SettlementExchangeClient, account_id: str
-) -> dict | None:
+def _check_attestation_freshness(client: SettlementExchangeClient, account_id: str) -> dict | None:
     """Check whether an agent's attestations are still valid (OCSP-style).
 
     Returns a dict with freshness info, or None if the check is unavailable.
@@ -117,7 +115,7 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
     requester_disputes = _count_recent_disputes(client, escrow_data["requester_id"])
     provider_disputes = _count_recent_disputes(client, escrow_data["provider_id"])
 
-    requester_evidence, provider_evidence = _fetch_structured_evidence(
+    requester_evidence, provider_evidence, oracle_evidence = _fetch_structured_evidence(
         client, escrow_id, escrow_data["requester_id"], escrow_data["provider_id"]
     )
 
@@ -132,6 +130,7 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
         provider_recent_disputes=provider_disputes,
         requester_evidence=requester_evidence,
         provider_evidence=provider_evidence,
+        oracle_evidence=oracle_evidence,
         requester_attestation_freshness=requester_freshness,
         provider_attestation_freshness=provider_freshness,
         collected_at=datetime.now(timezone.utc),
@@ -169,10 +168,11 @@ def _fetch_structured_evidence(
     escrow_id: str,
     requester_id: str,
     provider_id: str,
-) -> tuple[list[StructuredEvidence], list[StructuredEvidence]]:
-    """Fetch structured evidence submissions from both parties."""
+) -> tuple[list[StructuredEvidence], list[StructuredEvidence], list[StructuredEvidence]]:
+    """Fetch structured evidence submissions from both parties and any oracles."""
     requester_evidence: list[StructuredEvidence] = []
     provider_evidence: list[StructuredEvidence] = []
+    oracle_evidence: list[StructuredEvidence] = []
 
     try:
         data = client.list_evidence(escrow_id=escrow_id)
@@ -187,13 +187,17 @@ def _fetch_structured_evidence(
                 content_hash=item.get("content_hash", ""),
                 attestor_id=item.get("attestor_id"),
                 attestor_signature=item.get("attestor_signature"),
+                source_type=item.get("source_type", "party"),
+                oracle_id=item.get("oracle_id"),
                 submitted_at=item.get("submitted_at"),
             )
-            if se.submitter_id == requester_id:
+            if se.source_type == "oracle":
+                oracle_evidence.append(se)
+            elif se.submitter_id == requester_id:
                 requester_evidence.append(se)
             elif se.submitter_id == provider_id:
                 provider_evidence.append(se)
     except Exception:
         logger.warning("Failed to fetch structured evidence for escrow %s", escrow_id)
 
-    return requester_evidence, provider_evidence
+    return requester_evidence, provider_evidence, oracle_evidence
