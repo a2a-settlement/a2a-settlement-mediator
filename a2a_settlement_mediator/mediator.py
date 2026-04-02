@@ -27,6 +27,7 @@ from a2a_settlement_mediator.schemas import (
     MediatorContext,
     ProvenanceResult,
     Resolution,
+    StructuredDiagnostic,
     Verdict,
     VerdictOutcome,
 )
@@ -93,6 +94,8 @@ def _call_llm(
     requester_evidence_json: str | None = None,
     provider_evidence_json: str | None = None,
     oracle_evidence_json: str | None = None,
+    mode: str | None = None,
+    task_type: str | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
@@ -106,6 +109,8 @@ def _call_llm(
         requester_evidence_json=requester_evidence_json,
         provider_evidence_json=provider_evidence_json,
         oracle_evidence_json=oracle_evidence_json,
+        mode=mode,
+        task_type=task_type,
     )
 
     t0 = time.monotonic()
@@ -144,12 +149,29 @@ def _call_llm(
 # ---------------------------------------------------------------------------
 
 
+def _parse_structured_diagnostic(llm_output: dict) -> StructuredDiagnostic | None:
+    """Extract and validate structured_diagnostic from LLM output, if present."""
+    raw = llm_output.get("structured_diagnostic")
+    if not raw or not isinstance(raw, dict):
+        return None
+    try:
+        return StructuredDiagnostic(
+            task_type=raw.get("task_type"),
+            actionable_gaps=raw.get("actionable_gaps") or [],
+            details=raw.get("details"),
+        )
+    except Exception as exc:
+        logger.warning("Could not parse structured_diagnostic: %s", exc)
+        return None
+
+
 def _build_verdict(escrow_id: str, llm_output: dict) -> Verdict:
     """Convert raw LLM output into a typed Verdict with outcome classification."""
     resolution_str = llm_output.get("resolution", "").lower()
     confidence = float(llm_output.get("confidence", 0.0))
     reasoning = llm_output.get("reasoning", "No reasoning provided")
     factors = llm_output.get("factors", [])
+    structured_diagnostic = _parse_structured_diagnostic(llm_output)
 
     # Clamp confidence to valid range
     confidence = max(0.0, min(1.0, confidence))
@@ -168,6 +190,7 @@ def _build_verdict(escrow_id: str, llm_output: dict) -> Verdict:
             confidence=0.0,
             reasoning=f"LLM returned unrecognized resolution: {resolution_str!r}",
             factors=factors,
+            structured_diagnostic=structured_diagnostic,
         )
 
     # Apply confidence threshold
@@ -187,6 +210,7 @@ def _build_verdict(escrow_id: str, llm_output: dict) -> Verdict:
         confidence=confidence,
         reasoning=reasoning,
         factors=factors,
+        structured_diagnostic=structured_diagnostic,
     )
 
 
@@ -355,7 +379,11 @@ def _run_provenance_verification(evidence) -> ProvenanceResult | None:
         )
 
 
-def mediate(escrow_id: str) -> AuditRecord:
+def mediate(
+    escrow_id: str,
+    mode: str | None = None,
+    task_type: str | None = None,
+) -> AuditRecord:
     """Run the full mediation pipeline for a disputed escrow.
 
     Steps:
@@ -365,6 +393,14 @@ def mediate(escrow_id: str) -> AuditRecord:
     4. Apply confidence threshold
     5. Auto-resolve if confident, escalate otherwise
     6. Return full audit record
+
+    Args:
+        escrow_id: The escrow to mediate.
+        mode: Optional scoring mode (``"training"`` or ``"production"``).
+            When ``"training"``, the LLM is instructed to produce a
+            ``structured_diagnostic`` in its response.
+        task_type: Optional task type string.  When provided, structured
+            diagnostic output is requested regardless of ``mode``.
 
     Returns:
         AuditRecord with complete mediation trace.
@@ -437,6 +473,8 @@ def mediate(escrow_id: str) -> AuditRecord:
             requester_evidence_json=req_ev_json,
             provider_evidence_json=prov_ev_json,
             oracle_evidence_json=oracle_ev_json,
+            mode=mode,
+            task_type=task_type,
         )
         verdict = _build_verdict(escrow_id, llm_output)
     except json.JSONDecodeError as exc:

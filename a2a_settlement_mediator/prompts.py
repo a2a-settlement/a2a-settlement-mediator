@@ -130,6 +130,8 @@ def build_evaluation_prompt(
     requester_evidence_json: str | None = None,
     provider_evidence_json: str | None = None,
     oracle_evidence_json: str | None = None,
+    mode: str | None = None,
+    task_type: str | None = None,
 ) -> str:
     """Build the user-turn prompt with the evidence bundle injected.
 
@@ -143,6 +145,11 @@ def build_evaluation_prompt(
         provider_evidence_json: Optional serialised provider evidence submissions.
         oracle_evidence_json: Optional serialised oracle/third-party evidence
             submissions (source_type="oracle").
+        mode: Optional scoring mode — ``"training"`` or ``"production"``.
+            When ``"training"``, structured diagnostic output is required.
+        task_type: Optional task type string (e.g. ``"data_structuring"``,
+            ``"summarization"``).  When provided, structured diagnostic output
+            is required regardless of ``mode``.
     """
     provenance_section = ""
     if provenance_result_json:
@@ -228,6 +235,47 @@ self-reported party evidence.
 
 """
 
+    # Structured diagnostic section — injected when mode=training or task_type is set
+    diagnostic_section = ""
+    diagnostic_instruction = ""
+    want_diagnostic = mode == "training" or bool(task_type)
+    if want_diagnostic:
+        task_label = f'"{task_type}"' if task_type else "unspecified"
+        diagnostic_section = f"""
+## Scoring Context
+
+This evaluation is running in **{mode or "training"} mode** for task type \
+{task_label}. In addition to the standard verdict, you MUST produce a \
+``structured_diagnostic`` object identifying specific, correctable deficiencies \
+in the deliverable so the agent can improve on the next iteration.
+
+"""
+        diagnostic_instruction = """
+10. Populate ``structured_diagnostic`` in your JSON response:
+    - ``task_type``: the task type string provided above (or null if unspecified).
+    - ``actionable_gaps``: a prioritised list of specific, correctable deficiencies \
+in the deliverable. Each item must be a concrete instruction the agent can act on \
+(e.g. "Field 'invoice_date' is missing from 3 of 7 records" not "output was incomplete"). \
+Order from highest to lowest impact on the score.
+    - ``details``: an optional object with task-type-appropriate breakdowns using \
+whatever key names best describe the gaps (e.g. ``missed_entities``, \
+``schema_violations``, ``omitted_points``, ``length_violations``). \
+Omit keys that are not relevant to this task type. Set to null if no \
+additional breakdown is needed.
+    The full required JSON shape is:
+    {
+      "resolution": "release" or "refund",
+      "confidence": 0.0 to 1.0,
+      "reasoning": "2-4 sentence explanation",
+      "factors": ["factor1", ...],
+      "structured_diagnostic": {
+        "task_type": "...",
+        "actionable_gaps": ["gap1", "gap2", ...],
+        "details": { ... } or null
+      }
+    }
+"""
+
     return f"""\
 Evaluate the following disputed escrow and render a verdict.
 
@@ -240,6 +288,7 @@ Evaluate the following disputed escrow and render a verdict.
 {oracle_evidence_section}\
 {requester_evidence_section}\
 {provider_evidence_section}\
+{diagnostic_section}\
 ## Instructions
 
 1. Examine the escrow details, deliverables, acceptance criteria, and dispute reason.
@@ -266,5 +315,6 @@ Evaluate the following disputed escrow and render a verdict.
    party evidence. An oracle with a signed attestor_signature at the highest trust \
    tier. Multiple agreeing oracle submissions should be treated as near-conclusive. \
    Adjust your confidence upward when oracle evidence corroborates one side's account.
-10. Respond with ONLY the JSON verdict object.
+{diagnostic_instruction}\
+Respond with ONLY the JSON verdict object.
 """

@@ -119,6 +119,28 @@ class ProvenanceResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Structured diagnostic (training / task-type scoring output)
+# ---------------------------------------------------------------------------
+
+
+class StructuredDiagnostic(BaseModel):
+    """Actionable gap analysis produced when mode=training or task_type is provided.
+
+    ``actionable_gaps`` is the primary gradient consumed by the iteration harness:
+    an ordered list of specific, correctable deficiencies in the deliverable.
+
+    ``details`` is an optional free-form dict populated by the LLM with
+    task-type-appropriate breakdowns (e.g. ``{"missed_entities": [...]}`` for
+    data tasks, ``{"omitted_points": [...]}`` for summarisation).  Its keys are
+    intentionally unvalidated so the schema can evolve without migrations.
+    """
+
+    task_type: str | None = None
+    actionable_gaps: list[str] = []
+    details: dict | None = None
+
+
+# ---------------------------------------------------------------------------
 # Verdict (LLM output, structured)
 # ---------------------------------------------------------------------------
 
@@ -132,6 +154,7 @@ class Verdict(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     reasoning: str
     factors: list[str] = []  # Key factors that influenced the decision
+    structured_diagnostic: StructuredDiagnostic | None = None
     issued_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

@@ -211,14 +211,31 @@ def get_audit(escrow_id: str):
     return record
 
 
+class MediationRequest(BaseModel):
+    """Optional request body for the manual mediation trigger.
+
+    All fields are optional so the endpoint remains backward-compatible
+    with callers that send no body.
+    """
+
+    mode: str | None = None
+    task_type: str | None = None
+
+
 @app.post("/mediate/{escrow_id}")
-def trigger_mediation(escrow_id: str):
+def trigger_mediation(escrow_id: str, req: MediationRequest | None = None):
     """Manually trigger mediation for a disputed escrow.
 
-    Useful for re-evaluation or testing. Runs synchronously and returns
-    the full audit record.
+    Accepts an optional JSON body with ``mode`` (``"training"`` or
+    ``"production"``) and ``task_type`` to enable structured diagnostic
+    output from the LLM.  Callers that send no body continue to work
+    as before.
+
+    Runs synchronously and returns the full audit record.
     """
-    audit = mediate(escrow_id)
+    mode = req.mode if req else None
+    task_type = req.task_type if req else None
+    audit = mediate(escrow_id, mode=mode, task_type=task_type)
     storage.save_audit_record(escrow_id, audit.model_dump_json())
     return audit.model_dump(mode="json")
 
