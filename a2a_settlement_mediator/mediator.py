@@ -19,8 +19,18 @@ from datetime import datetime, timezone
 import litellm
 
 from a2a_settlement_mediator.config import settings
+from a2a_settlement_mediator.digest import (
+    build_digest,
+    check_deliverable_integrity,
+    estimate_tokens,
+)
 from a2a_settlement_mediator.evidence import collect_evidence
-from a2a_settlement_mediator.prompts import SYSTEM_PROMPT, build_evaluation_prompt
+from a2a_settlement_mediator.prompts import (
+    DIGEST_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_digest_evaluation_prompt,
+    build_evaluation_prompt,
+)
 from a2a_settlement_mediator.provenance import ProvenanceVerifier
 from a2a_settlement_mediator.schemas import (
     AuditRecord,
@@ -134,6 +144,69 @@ def _call_llm(
         logger.info("LLM raw response (%dms): %s", latency_ms, raw_text)
 
     # Strip markdown fences if the LLM wrapped its response
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("\n", 1)[1] if "\n" in raw_text else raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        raw_text = raw_text.strip()
+
+    parsed = json.loads(raw_text)
+    return parsed, prompt_tokens, completion_tokens, latency_ms
+
+
+def _call_llm_digest(
+    digest: dict,
+    evidence_context_json: str,
+    provenance_result_json: str | None = None,
+    grounding_summary: dict | None = None,
+    vi_chain_summary: dict | None = None,
+    requester_evidence_json: str | None = None,
+    provider_evidence_json: str | None = None,
+    oracle_evidence_json: str | None = None,
+    mode: str | None = None,
+    task_type: str | None = None,
+) -> tuple[dict, int, int, int]:
+    """Send a deliverable digest to the LLM for evaluation.
+
+    Mirrors ``_call_llm`` but uses ``DIGEST_SYSTEM_PROMPT`` and
+    ``build_digest_evaluation_prompt`` so the LLM knows it is working
+    from a compact summary rather than the full raw payload.
+
+    Returns: (parsed_verdict_dict, prompt_tokens, completion_tokens, latency_ms)
+    """
+    user_prompt = build_digest_evaluation_prompt(
+        digest,
+        evidence_context_json,
+        provenance_result_json,
+        grounding_summary,
+        vi_chain_summary,
+        requester_evidence_json=requester_evidence_json,
+        provider_evidence_json=provider_evidence_json,
+        oracle_evidence_json=oracle_evidence_json,
+        mode=mode,
+        task_type=task_type,
+    )
+
+    t0 = time.monotonic()
+    response = litellm.completion(
+        model=settings.llm_model,
+        messages=[
+            {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=settings.llm_temperature,
+        max_tokens=settings.llm_max_tokens,
+        timeout=settings.llm_timeout_seconds,
+    )
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    raw_text = response.choices[0].message.content.strip()
+    prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+    completion_tokens = response.usage.completion_tokens if response.usage else 0
+
+    if settings.audit_log_enabled:
+        logger.info("LLM digest response (%dms): %s", latency_ms, raw_text)
+
     if raw_text.startswith("```"):
         raw_text = raw_text.split("\n", 1)[1] if "\n" in raw_text else raw_text[3:]
         if raw_text.endswith("```"):
@@ -436,69 +509,221 @@ def mediate(
     # 2c. Evaluate VI credential chain if present
     vi_chain_summary = _evaluate_vi_chain(evidence)
 
+    # 2d. Structural integrity check — runs on every deliverable, no LLM needed.
+    # DELIVERABLE_EMPTY / MALFORMED / SCHEMA_MISMATCH are provider-side failures
+    # and produce a scored verdict (AUTO_REFUND) without calling the LLM.
+    delivered_content = evidence.escrow.delivered_content
+    acceptance_criteria_str: str | None = None
+    if evidence.escrow.deliverables:
+        # Concatenate all acceptance criteria strings for the integrity check
+        criteria_parts = [
+            d.acceptance_criteria
+            for d in evidence.escrow.deliverables
+            if d.acceptance_criteria
+        ]
+        acceptance_criteria_str = "\n".join(criteria_parts) if criteria_parts else None
+
+    integrity = check_deliverable_integrity(delivered_content, acceptance_criteria_str)
+    if not integrity["ok"]:
+        code = integrity["code"]
+        reason = integrity["reason"]
+        logger.warning("Deliverable integrity check failed for escrow %s: %s — %s", escrow_id, code, reason)
+        structural_verdict = Verdict(
+            escrow_id=escrow_id,
+            outcome=VerdictOutcome.AUTO_REFUND,
+            resolution=Resolution.REFUND,
+            confidence=0.95,
+            reasoning=reason,
+            factors=[code],
+        )
+        structural_audit = AuditRecord(
+            escrow_id=escrow_id,
+            evidence=evidence,
+            verdict=structural_verdict,
+            provenance_result=provenance_result,
+            mediator_context=mediator_ctx,
+            llm_model=settings.llm_model,
+            evaluation_method="structural_error",
+            deliverable_size_bytes=len(delivered_content.encode("utf-8")) if delivered_content else 0,
+            created_at=datetime.now(timezone.utc),
+        )
+        # Execute refund on the exchange — this IS a legitimate quality failure
+        try:
+            mediator_ctx_dict = mediator_ctx.model_dump()
+            provenance_result_dict = provenance_result.model_dump() if provenance_result else None
+            structural_audit.exchange_response = _execute_resolution(
+                escrow_id,
+                Resolution.REFUND,
+                provenance_result_dict,
+                mediator_context=mediator_ctx_dict,
+                stake_ruling="forfeit",
+            )
+            logger.info(
+                "Structural integrity failure auto-refunded escrow %s (%s)",
+                escrow_id,
+                code,
+            )
+        except Exception as exc:
+            logger.error("Failed to execute structural-error refund on exchange: %s", exc)
+            structural_audit.error = str(exc)
+            structural_audit.exchange_response = {"error": str(exc)}
+        if settings.audit_log_enabled:
+            logger.info("Audit record: %s", structural_audit.model_dump_json(indent=2))
+        return structural_audit
+
+    # 2e. Size routing — if the evidence bundle exceeds the token budget, build
+    # a programmatic digest and evaluate that instead of the raw payload.
+    # This prevents silent truncation producing false high-confidence verdicts.
+    import json as _json_mod
+
+    req_ev_json = (
+        _json_mod.dumps(
+            [e.model_dump(mode="json") for e in evidence.requester_evidence], indent=2
+        )
+        if evidence.requester_evidence
+        else None
+    )
+    prov_ev_json = (
+        _json_mod.dumps(
+            [e.model_dump(mode="json") for e in evidence.provider_evidence], indent=2
+        )
+        if evidence.provider_evidence
+        else None
+    )
+    oracle_ev_json = (
+        _json_mod.dumps([e.model_dump(mode="json") for e in evidence.oracle_evidence], indent=2)
+        if evidence.oracle_evidence
+        else None
+    )
+
+    deliverable_size_bytes = len(delivered_content.encode("utf-8")) if delivered_content else 0
+    total_tokens = estimate_tokens(evidence_json)
+    use_digest = total_tokens > settings.mediator_token_budget
+
     # 3. Evaluate via LLM
     exchange_response = None
     error = None
     prompt_tokens = 0
     completion_tokens = 0
     latency_ms = 0
+    evaluation_method = "direct"
+    digest_size_tokens: int | None = None
 
-    try:
-        import json as _json_mod
+    if use_digest:
+        logger.info(
+            "Deliverable for escrow %s exceeds token budget (%d > %d tokens); "
+            "routing through digest pipeline",
+            escrow_id,
+            total_tokens,
+            settings.mediator_token_budget,
+        )
+        try:
+            digest = build_digest(delivered_content or "", acceptance_criteria_str)
+            digest_json_str = _json_mod.dumps(digest)
+            digest_size_tokens = estimate_tokens(digest_json_str)
 
-        req_ev_json = (
-            _json_mod.dumps(
-                [e.model_dump(mode="json") for e in evidence.requester_evidence], indent=2
+            # Build a slimmed evidence context JSON: strip delivered_content so
+            # the full payload doesn't sneak back into the prompt.
+            evidence_dict = evidence.model_dump(mode="json")
+            evidence_dict["escrow"]["delivered_content"] = (
+                f"[OMITTED — {deliverable_size_bytes} bytes, evaluated via digest above]"
             )
-            if evidence.requester_evidence
-            else None
-        )
-        prov_ev_json = (
-            _json_mod.dumps(
-                [e.model_dump(mode="json") for e in evidence.provider_evidence], indent=2
+            evidence_context_json = _json_mod.dumps(evidence_dict, indent=2)
+
+            llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm_digest(
+                digest,
+                evidence_context_json,
+                provenance_result_json,
+                grounding_summary,
+                vi_chain_summary,
+                requester_evidence_json=req_ev_json,
+                provider_evidence_json=prov_ev_json,
+                oracle_evidence_json=oracle_ev_json,
+                mode=mode,
+                task_type=task_type,
             )
-            if evidence.provider_evidence
-            else None
-        )
-        oracle_ev_json = (
-            _json_mod.dumps([e.model_dump(mode="json") for e in evidence.oracle_evidence], indent=2)
-            if evidence.oracle_evidence
-            else None
-        )
-        llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
-            evidence_json,
-            provenance_result_json,
-            grounding_summary,
-            vi_chain_summary,
-            requester_evidence_json=req_ev_json,
-            provider_evidence_json=prov_ev_json,
-            oracle_evidence_json=oracle_ev_json,
-            mode=mode,
-            task_type=task_type,
-        )
-        verdict = _build_verdict(escrow_id, llm_output)
-    except json.JSONDecodeError as exc:
-        logger.error("Failed to parse LLM response as JSON: %s", exc)
-        verdict = Verdict(
-            escrow_id=escrow_id,
-            outcome=VerdictOutcome.ESCALATE,
-            confidence=0.0,
-            reasoning=f"LLM response was not valid JSON: {exc}",
-        )
-        error = str(exc)
-    except Exception as exc:
-        logger.error("LLM evaluation failed: %s", exc)
-        verdict = Verdict(
-            escrow_id=escrow_id,
-            outcome=VerdictOutcome.ESCALATE,
-            confidence=0.0,
-            reasoning=f"LLM evaluation failed: {exc}",
-        )
-        error = str(exc)
+            verdict = _build_verdict(escrow_id, llm_output)
+            evaluation_method = "digest"
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse digest LLM response as JSON: %s", exc)
+            verdict = Verdict(
+                escrow_id=escrow_id,
+                outcome=VerdictOutcome.ESCALATE,
+                confidence=0.0,
+                reasoning=f"Digest LLM response was not valid JSON: {exc}",
+            )
+            error = str(exc)
+            evaluation_method = "digest"
+        except Exception as exc:
+            # The digest pipeline itself failed — this is a platform failure,
+            # not a provider failure.  Escalate without scoring.
+            logger.error(
+                "MEDIATION_PROCESSING_FAILURE for escrow %s: %s", escrow_id, exc
+            )
+            verdict = Verdict(
+                escrow_id=escrow_id,
+                outcome=VerdictOutcome.ESCALATE,
+                confidence=0.0,
+                reasoning=(
+                    f"MEDIATION_PROCESSING_FAILURE: Mediator could not process "
+                    f"deliverable. No quality score recorded. ({exc})"
+                ),
+            )
+            error = str(exc)
+            evaluation_method = "system_error"
+            # Return early — do not call _execute_resolution, do not score agent
+            system_error_audit = AuditRecord(
+                escrow_id=escrow_id,
+                evidence=evidence,
+                verdict=verdict,
+                provenance_result=provenance_result,
+                mediator_context=mediator_ctx,
+                llm_model=settings.llm_model,
+                error=error,
+                evaluation_method="system_error",
+                deliverable_size_bytes=deliverable_size_bytes,
+                created_at=datetime.now(timezone.utc),
+            )
+            _notify_escalation(verdict, evidence_json)
+            if settings.audit_log_enabled:
+                logger.info("Audit record: %s", system_error_audit.model_dump_json(indent=2))
+            return system_error_audit
+    else:
+        try:
+            llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm(
+                evidence_json,
+                provenance_result_json,
+                grounding_summary,
+                vi_chain_summary,
+                requester_evidence_json=req_ev_json,
+                provider_evidence_json=prov_ev_json,
+                oracle_evidence_json=oracle_ev_json,
+                mode=mode,
+                task_type=task_type,
+            )
+            verdict = _build_verdict(escrow_id, llm_output)
+            evaluation_method = "direct"
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse LLM response as JSON: %s", exc)
+            verdict = Verdict(
+                escrow_id=escrow_id,
+                outcome=VerdictOutcome.ESCALATE,
+                confidence=0.0,
+                reasoning=f"LLM response was not valid JSON: {exc}",
+            )
+            error = str(exc)
+        except Exception as exc:
+            logger.error("LLM evaluation failed: %s", exc)
+            verdict = Verdict(
+                escrow_id=escrow_id,
+                outcome=VerdictOutcome.ESCALATE,
+                confidence=0.0,
+                reasoning=f"LLM evaluation failed: {exc}",
+            )
+            error = str(exc)
 
     # 4. Execute or escalate
     provenance_result_dict = provenance_result.model_dump() if provenance_result else None
-
     mediator_ctx_dict = mediator_ctx.model_dump()
 
     if verdict.outcome in (VerdictOutcome.AUTO_RELEASE, VerdictOutcome.AUTO_REFUND):
@@ -546,6 +771,9 @@ def mediate(
         llm_latency_ms=latency_ms,
         exchange_response=exchange_response,
         error=error,
+        evaluation_method=evaluation_method,
+        deliverable_size_bytes=deliverable_size_bytes,
+        digest_size_tokens=digest_size_tokens,
         created_at=datetime.now(timezone.utc),
     )
 

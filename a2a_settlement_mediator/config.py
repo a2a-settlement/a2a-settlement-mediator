@@ -81,6 +81,14 @@ class MediatorSettings:
         1000,
     )
 
+    # --- Deliverable size routing ---
+    # Token budget for the full evidence bundle sent to the LLM.
+    # Deliverables exceeding this limit are routed through the digest pipeline
+    # instead of being passed raw, preventing silent truncation and false verdicts.
+    # Rough estimate: 1 token ≈ 4 chars for JSON. Default leaves ample room for
+    # the system prompt and acceptance criteria within a 32K-token context window.
+    mediator_token_budget: int = _get_int("MEDIATOR_TOKEN_BUDGET", 24_000)
+
     # --- Ingestion limits (Context Bomb mitigation) ---
     # Maximum length of the transcript_hash field (hex chars). SHA-256 = 64.
     max_transcript_hash_length: int = _get_int("MEDIATOR_MAX_TRANSCRIPT_HASH_LENGTH", 128)

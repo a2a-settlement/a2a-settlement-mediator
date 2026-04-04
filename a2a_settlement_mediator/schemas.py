@@ -189,6 +189,13 @@ class AuditRecord(BaseModel):
     llm_latency_ms: int = 0
     exchange_response: dict | None = None
     error: str | None = None
+    # How the deliverable was evaluated. "direct" = full content sent to LLM;
+    # "digest" = oversized deliverable was summarised before LLM evaluation;
+    # "structural_error" = pre-LLM integrity check failed (provider fault, scored);
+    # "system_error" = mediator processing failure (platform fault, not scored).
+    evaluation_method: Literal["direct", "digest", "structural_error", "system_error"] = "direct"
+    deliverable_size_bytes: int | None = None
+    digest_size_tokens: int | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

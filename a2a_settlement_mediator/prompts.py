@@ -3,6 +3,11 @@
 These prompts instruct the LLM to evaluate a disputed escrow and produce
 a structured verdict. The system prompt establishes the mediator's role
 and decision framework. The user prompt injects the evidence bundle.
+
+A second set of prompts (``DIGEST_SYSTEM_PROMPT`` / ``build_digest_evaluation_prompt``)
+is used when the raw deliverable is too large to fit in the LLM context window.
+In that case the deliverable is replaced with a programmatic digest so the LLM
+evaluates a compact summary rather than potentially-truncated raw content.
 """
 
 from __future__ import annotations
@@ -315,6 +320,256 @@ Evaluate the following disputed escrow and render a verdict.
    party evidence. An oracle with a signed attestor_signature at the highest trust \
    tier. Multiple agreeing oracle submissions should be treated as near-conclusive. \
    Adjust your confidence upward when oracle evidence corroborates one side's account.
+{diagnostic_instruction}\
+Respond with ONLY the JSON verdict object.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Digest evaluation prompts (used when deliverable exceeds token budget)
+# ---------------------------------------------------------------------------
+
+DIGEST_SYSTEM_PROMPT = """\
+You are an impartial AI mediator for the A2A Settlement Exchange. You are \
+evaluating a STRUCTURED DIGEST of a large deliverable, not the full deliverable \
+itself. The full deliverable passed structural integrity and schema validation \
+before reaching this evaluation step, confirming it is syntactically valid and \
+contains the expected top-level fields.
+
+Your job is to assess quality based on the digest contents and representative \
+samples. Apply the same decision framework as normal mediation, with the \
+following adjustments:
+
+## Digest Evaluation Rules
+
+DO NOT penalise for:
+- Apparent missing data — the digest is a summary, not the complete output. \
+  The full deliverable is intact and was validated before this step.
+- Truncation or incompleteness in sample items — samples were cut at 400 chars \
+  per field to keep the digest compact.
+- A low sample count — samples represent the first few items per section, not \
+  the full dataset.
+
+DO evaluate:
+- Whether the findings in the samples are substantive and evidence-backed.
+- Whether the structure (top-level keys, section count, finding count) is \
+  proportional to the task scope described in the acceptance criteria.
+- Whether evidence URLs appear legitimate and relevant to the task domain.
+- Whether the schema compliance check reports any missing required fields.
+- Whether the overall coverage (total findings vs. task requirements) suggests \
+  the provider completed meaningful work.
+
+## Decision Framework (unchanged)
+
+1. Deliverable Completeness — structure, section count, and finding density.
+2. Acceptance Criteria — are required fields present? Does the scope match?
+3. Dispute Reason — is the complaint specific and substantiated?
+4. Reputation History — provider and requester prior dispute patterns.
+5. Proportionality — is the dispute economically vs. quality-motivated?
+6–10. Provenance, grounding, VI chain, structured evidence, oracle evidence \
+      (same weights as standard evaluation).
+
+## Confidence Calibration for Digest Evaluation
+
+Because you are working from a summary, apply a modest confidence penalty of \
+~0.05–0.10 relative to what you would score on the full content. If the digest \
+signals are strong and consistent, you may still reach the auto-resolve \
+threshold. If signals are ambiguous, prefer escalation.
+
+## Response Format
+
+You MUST respond with ONLY a JSON object (no markdown fences, no preamble):
+
+{
+  "resolution": "release" or "refund",
+  "confidence": 0.0 to 1.0,
+  "reasoning": "2-4 sentence explanation referencing digest signals",
+  "factors": ["factor1", "factor2", "factor3"]
+}
+"""
+
+
+def build_digest_evaluation_prompt(
+    digest: dict,
+    evidence_context_json: str,
+    provenance_result_json: str | None = None,
+    grounding_summary: dict | None = None,
+    vi_chain_summary: dict | None = None,
+    requester_evidence_json: str | None = None,
+    provider_evidence_json: str | None = None,
+    oracle_evidence_json: str | None = None,
+    mode: str | None = None,
+    task_type: str | None = None,
+) -> str:
+    """Build the user-turn prompt for digest-based evaluation.
+
+    Args:
+        digest: The programmatic digest produced by ``build_digest()``.
+        evidence_context_json: Serialised ``EvidenceBundle`` with
+            ``delivered_content`` stripped out (to save tokens).
+        provenance_result_json: Optional serialised provenance result.
+        grounding_summary: Optional grounding assessment dict.
+        vi_chain_summary: Optional VI credential chain summary.
+        requester_evidence_json: Optional serialised requester evidence.
+        provider_evidence_json: Optional serialised provider evidence.
+        oracle_evidence_json: Optional serialised oracle evidence.
+        mode: Optional scoring mode (``"training"`` / ``"production"``).
+        task_type: Optional task type string.
+    """
+    import json as _json
+
+    digest_json = _json.dumps(digest, indent=2)
+
+    provenance_section = ""
+    if provenance_result_json:
+        provenance_section = f"""
+## Provenance Verification Result
+
+{provenance_result_json}
+
+"""
+
+    grounding_section = ""
+    if grounding_summary:
+        src_count = grounding_summary.get("source_count", 0)
+        coverage = grounding_summary.get("coverage", 0)
+        domain_count = grounding_summary.get("domain_count", 0)
+        flags = grounding_summary.get("flags", [])
+        grounding_section = f"""
+## Web Grounding Evidence
+
+The provider's deliverable was grounded against live web sources:
+- **Web sources cited**: {src_count}
+- **Text coverage**: {coverage:.0%} of deliverable backed by sources
+- **Source diversity**: {domain_count} distinct domain(s)
+- **Assessment flags**: {", ".join(flags) if flags else "none"}
+
+"""
+
+    vi_section = ""
+    if vi_chain_summary:
+        vi_mode = vi_chain_summary.get("mode", "unknown")
+        chain_present = vi_chain_summary.get("chain_present", False)
+        has_l3 = vi_chain_summary.get("has_l3", False)
+        structural_valid = vi_chain_summary.get("structural_valid", False)
+        flags = vi_chain_summary.get("flags", [])
+        vi_section = f"""
+## Verifiable Intent (VI) Authorization Chain
+
+- **Mode**: {vi_mode}
+- **Chain present**: {chain_present}
+- **L3 fulfillment credentials**: {
+            "present (agent proved constraint satisfaction)"
+            if has_l3
+            else "absent (immediate mode or not provided)"
+        }
+- **Structural integrity**: {"valid" if structural_valid else "could not be fully verified"}
+- **Assessment flags**: {", ".join(flags) if flags else "none"}
+
+"""
+
+    requester_evidence_section = ""
+    if requester_evidence_json:
+        requester_evidence_section = f"""
+## Requester Structured Evidence
+
+{requester_evidence_json}
+
+"""
+
+    provider_evidence_section = ""
+    if provider_evidence_json:
+        provider_evidence_section = f"""
+## Provider Structured Evidence
+
+{provider_evidence_json}
+
+"""
+
+    oracle_evidence_section = ""
+    if oracle_evidence_json:
+        oracle_evidence_section = f"""
+## Oracle / Third-Party Evidence
+
+The following evidence was submitted by registered oracle accounts — neutral \
+third parties verified by the exchange operator. This evidence is independent \
+of both disputing parties and carries higher evidentiary weight than \
+self-reported party evidence.
+
+{oracle_evidence_json}
+
+"""
+
+    diagnostic_section = ""
+    diagnostic_instruction = ""
+    want_diagnostic = mode == "training" or bool(task_type)
+    if want_diagnostic:
+        task_label = f'"{task_type}"' if task_type else "unspecified"
+        diagnostic_section = f"""
+## Scoring Context
+
+This evaluation is running in **{mode or "training"} mode** for task type \
+{task_label}. In addition to the standard verdict, you MUST produce a \
+``structured_diagnostic`` object identifying specific, correctable deficiencies \
+in the deliverable so the agent can improve on the next iteration. Base your \
+gap analysis on the digest samples and schema compliance data.
+
+"""
+        diagnostic_instruction = """
+10. Populate ``structured_diagnostic`` in your JSON response based on digest signals:
+    - ``task_type``: the task type string provided above (or null if unspecified).
+    - ``actionable_gaps``: a prioritised list of specific, correctable deficiencies \
+inferred from the digest samples and schema compliance report. Order from \
+highest to lowest impact.
+    - ``details``: an optional object with task-type-appropriate breakdowns. \
+Set to null if no additional breakdown is needed.
+    The full required JSON shape is:
+    {
+      "resolution": "release" or "refund",
+      "confidence": 0.0 to 1.0,
+      "reasoning": "2-4 sentence explanation",
+      "factors": ["factor1", ...],
+      "structured_diagnostic": {
+        "task_type": "...",
+        "actionable_gaps": ["gap1", "gap2", ...],
+        "details": { ... } or null
+      }
+    }
+"""
+
+    return f"""\
+Evaluate the following disputed escrow. The provider submitted a LARGE \
+deliverable that has been pre-validated (JSON parsed successfully, required \
+fields present) and summarised into the digest below. Assess quality from \
+the digest signals and render a verdict.
+
+## Evidence Context (escrow metadata, accounts, dispute reason)
+
+{evidence_context_json}
+
+## Deliverable Digest
+
+The raw deliverable was {digest.get("total_size_bytes", "unknown")} bytes. \
+It passed structural integrity and schema validation before this step.
+
+{digest_json}
+{provenance_section}\
+{grounding_section}\
+{vi_section}\
+{oracle_evidence_section}\
+{requester_evidence_section}\
+{provider_evidence_section}\
+{diagnostic_section}\
+## Instructions
+
+1. Examine the escrow details, acceptance criteria, and dispute reason from the evidence context.
+2. Assess the deliverable digest: structure proportionality, sample quality, evidence URL legitimacy.
+3. Consider schema compliance — missing required fields are a legitimate quality signal.
+4. Weigh both parties' reputation scores and dispute history.
+5. Factor in provenance, grounding, VI chain, and structured evidence if present.
+6. Oracle evidence from registered third parties carries the highest evidentiary weight.
+7. Apply a modest confidence penalty (~0.05–0.10) for digest-based uncertainty.
+   Prefer escalation when signals are ambiguous.
 {diagnostic_instruction}\
 Respond with ONLY the JSON verdict object.
 """
