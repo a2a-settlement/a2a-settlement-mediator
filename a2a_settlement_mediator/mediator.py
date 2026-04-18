@@ -106,6 +106,7 @@ def _call_llm(
     oracle_evidence_json: str | None = None,
     mode: str | None = None,
     task_type: str | None = None,
+    model_override: str | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
@@ -125,7 +126,7 @@ def _call_llm(
 
     t0 = time.monotonic()
     response = litellm.completion(
-        model=settings.llm_model,
+        model=model_override or settings.llm_model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -312,6 +313,65 @@ def _execute_resolution(
     )
 
 
+def _null_resolution(
+    escrow_id: str,
+    evidence,
+    mediator_ctx: MediatorContext,
+) -> AuditRecord:
+    """Return funds to requester without LLM arbitration for confirmed self-dealing.
+
+    No EMA movement, no ATE reward on either side. Adds a compliance queue
+    entry so the operator can review the pattern.
+    """
+    from a2a_settlement_mediator.storage import add_compliance_queue_entry, save_audit_record
+
+    logger.warning(
+        "Null-resolving self-dealing dispute for escrow %s — refunding requester without LLM",
+        escrow_id,
+    )
+
+    verdict = Verdict(
+        escrow_id=escrow_id,
+        outcome=VerdictOutcome.NULL_RESOLUTION,
+        resolution=Resolution.REFUND,
+        confidence=1.0,
+        reasoning=(
+            "Transaction classified as self_dealing at escrow creation. "
+            "Escrow returned to requester without arbitration per anti-self-dealing policy."
+        ),
+        factors=["self_dealing_classification"],
+    )
+
+    exchange_response: dict | None = None
+    error: str | None = None
+    try:
+        exchange_response = _execute_resolution(
+            escrow_id,
+            Resolution.REFUND,
+            provenance_result=None,
+            mediator_context=mediator_ctx.model_dump(),
+        )
+    except Exception as exc:
+        logger.error("Failed to execute null-resolution refund for escrow %s: %s", escrow_id, exc)
+        error = str(exc)
+        exchange_response = {"error": str(exc)}
+
+    add_compliance_queue_entry(escrow_id, "null_resolution")
+
+    audit = AuditRecord(
+        escrow_id=escrow_id,
+        evidence=evidence,
+        verdict=verdict,
+        mediator_context=mediator_ctx,
+        llm_model="none",
+        exchange_response=exchange_response,
+        error=error,
+        evaluation_method="structural_error",
+    )
+    save_audit_record(escrow_id, audit.model_dump_json())
+    return audit
+
+
 def _notify_escalation(verdict: Verdict, evidence_json: str) -> None:
     """Send an escalation notice to the configured webhook (e.g., Slack)."""
     if not settings.escalation_webhook_url:
@@ -488,6 +548,26 @@ def mediate(
 
     # 1b. Decrypt encrypted evidence if present (TEE/vault)
     _decrypt_evidence_artifacts(evidence)
+
+    # 1.5 — Anti-self-dealing pre-flight: short-circuit before any LLM call.
+    # Hard self-dealing → null-resolution (no LLM, no EMA movement, refund to requester).
+    # Suspected self-dealing → escalate to Sonnet tier; flag for human review if large.
+    sdc = evidence.escrow.self_dealing_class
+    if sdc == "self_dealing":
+        return _null_resolution(escrow_id, evidence, mediator_ctx)
+
+    llm_model_override: str | None = None
+    if sdc == "suspected_self_dealing":
+        llm_model_override = settings.llm_model_sonnet
+        if evidence.escrow.amount > settings.suspected_self_dealing_review_threshold:
+            logger.warning(
+                "Suspected self-dealing escrow %s (amount=%d) exceeds review threshold — "
+                "flagging for human review before finalization",
+                escrow_id,
+                evidence.escrow.amount,
+            )
+            from a2a_settlement_mediator.storage import add_compliance_queue_entry
+            add_compliance_queue_entry(escrow_id, "suspected_self_dealing_review_required")
 
     evidence_json = evidence.model_dump_json(indent=2)
 
@@ -700,6 +780,7 @@ def mediate(
                 oracle_evidence_json=oracle_ev_json,
                 mode=mode,
                 task_type=task_type,
+                model_override=llm_model_override,
             )
             verdict = _build_verdict(escrow_id, llm_output)
             evaluation_method = "direct"

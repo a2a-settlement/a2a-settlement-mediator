@@ -22,6 +22,7 @@ class VerdictOutcome(str, Enum):
     AUTO_RELEASE = "auto_release"
     AUTO_REFUND = "auto_refund"
     ESCALATE = "escalate"
+    NULL_RESOLUTION = "null_resolution"
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,7 @@ class EscrowEvidence(BaseModel):
     delivered_at: datetime | None = None
     created_at: datetime | None = None
     expires_at: datetime | None = None
+    self_dealing_class: str | None = None
 
 
 class AccountEvidence(BaseModel):

@@ -38,8 +38,18 @@ class MediatorSettings:
 
     # --- LLM provider (via LiteLLM) ---
     llm_model: str = os.getenv("MEDIATOR_LLM_MODEL", "anthropic/claude-sonnet-4-20250514")
+    llm_model_sonnet: str = os.getenv(
+        "MEDIATOR_LLM_MODEL_SONNET", "anthropic/claude-sonnet-4-20250514"
+    )
     llm_temperature: float = _get_float("MEDIATOR_LLM_TEMPERATURE", 0.1)
     llm_max_tokens: int = _get_int("MEDIATOR_LLM_MAX_TOKENS", 4096)
+
+    # --- Anti-self-dealing ---
+    # Suspected self-dealing disputes above this ATE amount require human review
+    # before the mediator finalizes its resolution.
+    suspected_self_dealing_review_threshold: int = _get_int(
+        "MEDIATOR_SUSPECTED_SD_REVIEW_THRESHOLD", 1000
+    )
 
     # --- Mediation policy ---
     # Confidence threshold (0.0–1.0). Verdicts below this are escalated to human.
