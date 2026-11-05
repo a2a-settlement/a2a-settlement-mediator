@@ -141,6 +141,7 @@ def build_evaluation_prompt(
     oracle_evidence_json: str | None = None,
     mode: str | None = None,
     task_type: str | None = None,
+    hash_verification_result: dict | None = None,
 ) -> str:
     """Build the user-turn prompt with the evidence bundle injected.
 
@@ -159,6 +160,10 @@ def build_evaluation_prompt(
         task_type: Optional task type string (e.g. ``"data_structuring"``,
             ``"summarization"``).  When provided, structured diagnostic output
             is required regardless of ``mode``.
+        hash_verification_result: Optional result from
+            ``verify_verification_artifacts()`` — a programmatic SHA-256 check
+            performed before this LLM call.  Injected as an objective fact so
+            the LLM does not need to report hash-verification uncertainty.
     """
     provenance_section = ""
     if provenance_result_json:
@@ -244,6 +249,26 @@ self-reported party evidence.
 
 """
 
+    hash_verification_section = ""
+    if hash_verification_result is not None:
+        match = hash_verification_result.get("hash_match", False)
+        field = hash_verification_result.get("field", "api_call_raw")
+        endpoint = hash_verification_result.get("endpoint_url", "")
+        endpoint_line = f"\n- **Endpoint attested**: {endpoint}" if endpoint else ""
+        status_word = "PASSED" if match else "FAILED"
+        hash_verification_section = f"""
+## Programmatic Hash Verification
+
+A SHA-256 hash check was performed by the mediator before this evaluation:
+
+- **Result**: {status_word}
+- **Field hashed**: `verification_artifacts.{field}`
+- **Hash match**: {match}{endpoint_line}
+
+{"The provider's content hash is cryptographically verified. Do not penalise for hash uncertainty." if match else "WARNING: The computed hash does NOT match the claimed content_hash. This is a strong signal the raw API response was altered or incorrectly recorded."}
+
+"""
+
     # Structured diagnostic section — injected when mode=training or task_type is set
     diagnostic_section = ""
     diagnostic_instruction = ""
@@ -297,6 +322,7 @@ Evaluate the following disputed escrow and render a verdict.
 {oracle_evidence_section}\
 {requester_evidence_section}\
 {provider_evidence_section}\
+{hash_verification_section}\
 {diagnostic_section}\
 ## Instructions
 
@@ -404,6 +430,7 @@ def build_digest_evaluation_prompt(
     oracle_evidence_json: str | None = None,
     mode: str | None = None,
     task_type: str | None = None,
+    hash_verification_result: dict | None = None,
 ) -> str:
     """Build the user-turn prompt for digest-based evaluation.
 
@@ -419,6 +446,9 @@ def build_digest_evaluation_prompt(
         oracle_evidence_json: Optional serialised oracle evidence.
         mode: Optional scoring mode (``"training"`` / ``"production"``).
         task_type: Optional task type string.
+        hash_verification_result: Optional result from
+            ``verify_verification_artifacts()`` — injected as an objective
+            fact so the LLM does not report hash-verification uncertainty.
     """
     import json as _json
 
@@ -504,6 +534,26 @@ self-reported party evidence.
 
 """
 
+    hash_verification_section = ""
+    if hash_verification_result is not None:
+        match = hash_verification_result.get("hash_match", False)
+        field = hash_verification_result.get("field", "api_call_raw")
+        endpoint = hash_verification_result.get("endpoint_url", "")
+        endpoint_line = f"\n- **Endpoint attested**: {endpoint}" if endpoint else ""
+        status_word = "PASSED" if match else "FAILED"
+        hash_verification_section = f"""
+## Programmatic Hash Verification
+
+A SHA-256 hash check was performed by the mediator before this evaluation:
+
+- **Result**: {status_word}
+- **Field hashed**: `verification_artifacts.{field}`
+- **Hash match**: {match}{endpoint_line}
+
+{"The provider's content hash is cryptographically verified. Do not penalise for hash uncertainty." if match else "WARNING: The computed hash does NOT match the claimed content_hash. This is a strong signal the raw API response was altered or incorrectly recorded."}
+
+"""
+
     diagnostic_section = ""
     diagnostic_instruction = ""
     want_diagnostic = mode == "training" or bool(task_type)
@@ -563,6 +613,7 @@ It passed structural integrity and schema validation before this step.
 {oracle_evidence_section}\
 {requester_evidence_section}\
 {provider_evidence_section}\
+{hash_verification_section}\
 {diagnostic_section}\
 ## Instructions
 

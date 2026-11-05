@@ -13,7 +13,9 @@ import logging
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -135,11 +137,44 @@ def _verify_patch_signature(body: bytes, signature: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _exchange_error(escrow_id: str, exc: httpx.HTTPStatusError) -> HTTPException:
+    """Translate an exchange HTTP failure into a response the caller can act on.
+
+    Without this the mediator surfaces a bare 500 for every exchange-side
+    problem, which hides the difference between "this escrow does not exist"
+    and "the exchange rejected our credentials".
+    """
+    status = exc.response.status_code
+    if status == 404:
+        return HTTPException(
+            status_code=404, detail=f"Escrow {escrow_id!r} not found on the exchange"
+        )
+    if status in (401, 403):
+        return HTTPException(
+            status_code=502,
+            detail=(
+                f"The exchange rejected the mediator's credentials ({status}). "
+                "Check A2A_OPERATOR_API_KEY and that its account is active "
+                "with operator status."
+            ),
+        )
+    return HTTPException(
+        status_code=502, detail=f"Exchange returned {status} for escrow {escrow_id!r}"
+    )
+
+
 def _run_mediation(escrow_id: str) -> None:
     """Run mediation in a background thread."""
     try:
         audit = mediate(escrow_id)
         storage.save_audit_record(escrow_id, audit.model_dump_json())
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Background mediation failed for escrow %s: exchange returned %s for %s",
+            escrow_id,
+            exc.response.status_code,
+            exc.request.url,
+        )
     except Exception:
         logger.exception("Background mediation failed for escrow %s", escrow_id)
 
@@ -147,6 +182,10 @@ def _run_mediation(escrow_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+_GUIDE_PATH = Path(__file__).parent.parent / "docs" / "bounty-design-guide.md"
+_GUIDE_VERSION = "1.0"
 
 
 @app.get("/health")
@@ -157,6 +196,36 @@ def health():
         "version": "0.1.0",
         "auto_resolve_threshold": settings.auto_resolve_threshold,
         "llm_model": settings.llm_model,
+        "guide_url": "https://exchange.a2a-settlement.org/mediator/guide",
+    }
+
+
+@app.get("/guide")
+def bounty_design_guide():
+    """Return the bounty design guide for agents posting SettleBridge bounties.
+
+    This endpoint is the primary discovery mechanism for external agents that
+    have no prior knowledge of the mediator's verification pipeline.  Any agent
+    that hits ``/health`` first will find ``guide_url`` pointing here.
+
+    Returns a JSON object with:
+    - ``format``: always ``"text/markdown"``
+    - ``version``: guide schema version
+    - ``content``: full guide text in Markdown
+    - ``source``: canonical GitHub URL for the guide
+    """
+    if not _GUIDE_PATH.exists():
+        raise HTTPException(status_code=404, detail="Bounty design guide not found.")
+    content = _GUIDE_PATH.read_text(encoding="utf-8")
+    return {
+        "format": "text/markdown",
+        "version": _GUIDE_VERSION,
+        "content": content,
+        "public_url": "https://exchange.a2a-settlement.org/mediator/guide",
+        "source": (
+            "https://github.com/a2a-settlement/a2a-settlement-mediator"
+            "/blob/main/docs/bounty-design-guide.md"
+        ),
     }
 
 
@@ -250,7 +319,10 @@ def trigger_mediation(escrow_id: str, req: MediationRequest | None = None):
     """
     mode = req.mode if req else None
     task_type = req.task_type if req else None
-    audit = mediate(escrow_id, mode=mode, task_type=task_type)
+    try:
+        audit = mediate(escrow_id, mode=mode, task_type=task_type)
+    except httpx.HTTPStatusError as exc:
+        raise _exchange_error(escrow_id, exc) from exc
     storage.save_audit_record(escrow_id, audit.model_dump_json())
     return audit.model_dump(mode="json")
 

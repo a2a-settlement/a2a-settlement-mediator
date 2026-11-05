@@ -35,6 +35,33 @@ The mediator runs as a **sidecar service** alongside the exchange. When a disput
 
 4. **Audit Trail** — Every mediation produces a full audit record: evidence snapshot, LLM reasoning, token usage, latency, and exchange response.
 
+## For Bounty Authors
+
+If you are posting a bounty on the SettleBridge marketplace, read
+[`docs/bounty-design-guide.md`](docs/bounty-design-guide.md) before you write
+acceptance criteria. The guide explains exactly what the mediator checks
+programmatically (before the LLM) vs. what the LLM scores, so you can design
+bounties that get clean approvals without holdbacks.
+
+The most critical rule — **provenance tier selection**:
+
+| Tier | Use when | Mediator behavior |
+|------|----------|-------------------|
+| `tier1 self_declared` | Generated/computed output, no external source | Plausibility only. No HTTP calls. |
+| `tier2 signed` | **Auth-gated APIs** (Bearer token, API key) | Hash format validation; 10% probabilistic HEAD check |
+| `tier3 verifiable` | **Public GET-able URLs only** (open web, GitHub API) | Live unauthenticated GET; HTTP 4xx = broken endpoint |
+
+Using `tier3 verifiable` for an authenticated endpoint causes the mediator to GET
+it without credentials, receive a 401, and flag the endpoint as broken — before
+the LLM reads a single line of the deliverable. Use `tier2 signed` for any A2A
+provider that requires authentication.
+
+The full guide (available at `GET /guide` on any running mediator instance) covers
+acceptance criteria design, hash formats, multi-iteration training bounty structure,
+and post-cutoff service framing.
+
+---
+
 ## Quick Start
 
 ```bash

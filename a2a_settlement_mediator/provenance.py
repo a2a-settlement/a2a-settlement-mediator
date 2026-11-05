@@ -239,7 +239,12 @@ class ProvenanceVerifier:
                     else:
                         resp = await client.request(method, uri)
 
-                    if resp.status_code >= 400:
+                    if resp.status_code in (401, 403):
+                        # Auth-gated endpoint — reachable but requires credentials.
+                        # This is expected for A2A provider APIs (AlphaSignal, SentinelRecon,
+                        # etc.) that use Bearer tokens. Not a critical failure.
+                        flags.append(f"endpoint_auth_required:{uri[:80]}")
+                    elif resp.status_code >= 400:
                         flags.append(f"endpoint_error:{uri[:80]}:status={resp.status_code}")
                     else:
                         content_hash = ref.get("content_hash")
@@ -264,6 +269,8 @@ class ProvenanceVerifier:
             if f.startswith("hash_mismatch")
             or f.startswith("endpoint_error")
             or f.startswith("endpoint_unreachable")
+            # endpoint_auth_required is non-critical: endpoint is reachable,
+            # auth is expected for A2A provider APIs
         )
 
         if critical_count > 0:

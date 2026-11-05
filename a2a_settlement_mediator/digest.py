@@ -13,6 +13,7 @@ All functions are pure (no I/O, no LLM calls) so they are cheap and testable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -118,6 +119,88 @@ def _find_missing_fields(parsed: dict, acceptance_criteria: str) -> list[str]:
     quoted = re.findall(r'["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']', acceptance_criteria)
     missing = [f for f in quoted if f.lower() not in top_keys]
     return missing
+
+
+# ---------------------------------------------------------------------------
+# Verification artifact hash check
+# ---------------------------------------------------------------------------
+
+
+def verify_verification_artifacts(delivered_content: str | None) -> dict | None:
+    """Programmatically verify sha256(api_call_raw) == content_hash.
+
+    Many bounties (e.g. AlphaSignal ensemble forecasts) embed a raw API
+    response string and a SHA-256 hash of that string inside a
+    ``verification_artifacts`` object.  The LLM cannot recompute hashes, so
+    it reports "cannot verify" and applies a confidence penalty.  This
+    function does the check in pure Python before the LLM is called and
+    returns a structured result that can be injected into the evidence bundle
+    as an objective fact.
+
+    Looks for the following shape anywhere in the top-level deliverable JSON:
+
+        {
+          "verification_artifacts": {
+            "api_call_raw": "<raw JSON-RPC response string>",
+            "content_hash": "<64-char sha256 hex OR sha256:<hex>>",
+            "endpoint_url": "<optional, for informational purposes>"
+          }
+        }
+
+    Returns:
+        A dict with keys ``hash_match`` (bool), ``field`` (str),
+        ``expected`` (str), ``computed`` (str), and optionally
+        ``endpoint_url`` (str) — or ``None`` if the required fields are
+        absent (so callers can treat absence as neutral, not a failure).
+    """
+    if not delivered_content or not delivered_content.strip():
+        return None
+
+    try:
+        parsed = json.loads(delivered_content.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    artifacts = parsed.get("verification_artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+
+    raw_value = artifacts.get("api_call_raw")
+    expected_hash = artifacts.get("content_hash")
+
+    if not raw_value or not expected_hash:
+        return None
+
+    # Normalise: strip optional "sha256:" prefix so we always compare bare hex
+    normalised_expected = expected_hash
+    if normalised_expected.startswith("sha256:"):
+        normalised_expected = normalised_expected[len("sha256:"):]
+
+    computed_hex = hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
+    match = computed_hex == normalised_expected
+
+    result: dict = {
+        "hash_match": match,
+        "field": "api_call_raw",
+        "expected": normalised_expected,
+        "computed": computed_hex,
+    }
+
+    endpoint_url = artifacts.get("endpoint_url")
+    if endpoint_url:
+        result["endpoint_url"] = endpoint_url
+
+    if not match:
+        logger.warning(
+            "verification_artifacts hash mismatch: expected=%s computed=%s",
+            normalised_expected[:16] + "…",
+            computed_hex[:16] + "…",
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
