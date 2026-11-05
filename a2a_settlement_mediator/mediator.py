@@ -23,6 +23,7 @@ from a2a_settlement_mediator.digest import (
     build_digest,
     check_deliverable_integrity,
     estimate_tokens,
+    verify_verification_artifacts,
 )
 from a2a_settlement_mediator.evidence import collect_evidence
 from a2a_settlement_mediator.prompts import (
@@ -107,6 +108,7 @@ def _call_llm(
     mode: str | None = None,
     task_type: str | None = None,
     model_override: str | None = None,
+    hash_verification_result: dict | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send the evidence to the LLM and parse the verdict.
 
@@ -122,6 +124,7 @@ def _call_llm(
         oracle_evidence_json=oracle_evidence_json,
         mode=mode,
         task_type=task_type,
+        hash_verification_result=hash_verification_result,
     )
 
     t0 = time.monotonic()
@@ -166,6 +169,7 @@ def _call_llm_digest(
     oracle_evidence_json: str | None = None,
     mode: str | None = None,
     task_type: str | None = None,
+    hash_verification_result: dict | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send a deliverable digest to the LLM for evaluation.
 
@@ -186,6 +190,7 @@ def _call_llm_digest(
         oracle_evidence_json=oracle_evidence_json,
         mode=mode,
         task_type=task_type,
+        hash_verification_result=hash_verification_result,
     )
 
     t0 = time.monotonic()
@@ -651,7 +656,12 @@ def mediate(
             logger.info("Audit record: %s", structural_audit.model_dump_json(indent=2))
         return structural_audit
 
-    # 2e. Size routing — if the evidence bundle exceeds the token budget, build
+    # 2e. Pre-LLM hash verification — check sha256(api_call_raw) == content_hash
+    # if the deliverable contains a verification_artifacts block.  The LLM
+    # cannot recompute hashes; this puts the consistency result in the prompt.
+    hash_verification_result = verify_verification_artifacts(delivered_content)
+
+    # 2f. Size routing — if the evidence bundle exceeds the token budget, build
     # a programmatic digest and evaluate that instead of the raw payload.
     # This prevents silent truncation producing false high-confidence verdicts.
     import json as _json_mod
@@ -721,6 +731,7 @@ def mediate(
                 oracle_evidence_json=oracle_ev_json,
                 mode=mode,
                 task_type=task_type,
+                hash_verification_result=hash_verification_result,
             )
             verdict = _build_verdict(escrow_id, llm_output)
             evaluation_method = "digest"
@@ -781,6 +792,7 @@ def mediate(
                 mode=mode,
                 task_type=task_type,
                 model_override=llm_model_override,
+                hash_verification_result=hash_verification_result,
             )
             verdict = _build_verdict(escrow_id, llm_output)
             evaluation_method = "direct"

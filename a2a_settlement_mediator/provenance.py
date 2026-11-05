@@ -68,7 +68,11 @@ class ProvenanceVerifier:
             result.flags.extend(assessment.get("flags", []))
             boost = assessment.get("confidence_boost", 0.0)
             result.confidence = min(1.0, result.confidence + boost)
-            if assessment.get("recommendation") == "approve" and result.recommendation == "flag":
+            if (
+                assessment.get("recommendation") == "approve"
+                and result.recommendation == "flag"
+                and result.verified
+            ):
                 result.recommendation = "approve"
 
         return result
@@ -239,7 +243,12 @@ class ProvenanceVerifier:
                     else:
                         resp = await client.request(method, uri)
 
-                    if resp.status_code >= 400:
+                    if resp.status_code in (401, 403):
+                        # Reachable but auth-gated, so nothing was fetched or hashed.
+                        # Tier 3 promises an unauthenticated check; auth-gated sources
+                        # belong in tier 2 (signed).
+                        flags.append(f"endpoint_auth_required:{uri[:80]}")
+                    elif resp.status_code >= 400:
                         flags.append(f"endpoint_error:{uri[:80]}:status={resp.status_code}")
                     else:
                         content_hash = ref.get("content_hash")
@@ -273,6 +282,15 @@ class ProvenanceVerifier:
                 confidence=0.15,
                 flags=flags,
                 recommendation="reject",
+            )
+
+        if any(f.startswith("endpoint_auth_required") for f in flags):
+            return ProvenanceResult(
+                verified=False,
+                tier="verifiable",
+                confidence=0.3,
+                flags=[*flags, "tier_mismatch:auth_gated_source_use_signed_tier"],
+                recommendation="flag",
             )
 
         if flags:

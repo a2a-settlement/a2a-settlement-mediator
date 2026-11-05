@@ -64,6 +64,9 @@ class MediatorSettings:
     webhook_port: int = _get_int("MEDIATOR_PORT", 3100)
     # The webhook secret assigned by the exchange when the mediator registers its webhook.
     webhook_secret: str = os.getenv("MEDIATOR_WEBHOOK_SECRET", "")
+    # Public base URL clients use to reach this mediator, e.g. behind a path-prefix proxy.
+    # Empty means advertise relative paths.
+    public_url: str = os.getenv("MEDIATOR_PUBLIC_URL", "").rstrip("/")
 
     # --- Escalation ---
     # Webhook URL to POST escalation notices to (e.g., Slack incoming webhook).
