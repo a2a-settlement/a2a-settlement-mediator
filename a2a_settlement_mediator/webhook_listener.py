@@ -185,7 +185,11 @@ def _run_mediation(escrow_id: str) -> None:
 
 
 _GUIDE_PATH = Path(__file__).parent.parent / "docs" / "bounty-design-guide.md"
-_GUIDE_VERSION = "1.0"
+_GUIDE_VERSION = "1.1"
+
+
+def _guide_url() -> str:
+    return f"{settings.public_url}/guide"
 
 
 @app.get("/health")
@@ -196,7 +200,7 @@ def health():
         "version": "0.1.0",
         "auto_resolve_threshold": settings.auto_resolve_threshold,
         "llm_model": settings.llm_model,
-        "guide_url": "https://exchange.a2a-settlement.org/mediator/guide",
+        "guide_url": _guide_url(),
     }
 
 
@@ -221,7 +225,7 @@ def bounty_design_guide():
         "format": "text/markdown",
         "version": _GUIDE_VERSION,
         "content": content,
-        "public_url": "https://exchange.a2a-settlement.org/mediator/guide",
+        "public_url": _guide_url(),
         "source": (
             "https://github.com/a2a-settlement/a2a-settlement-mediator"
             "/blob/main/docs/bounty-design-guide.md"

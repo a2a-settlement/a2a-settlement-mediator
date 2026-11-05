@@ -130,6 +130,18 @@ You MUST respond with ONLY a JSON object (no markdown fences, no preamble):
 }
 """
 
+# The provider supplies both api_call_raw and content_hash, so a match proves
+# only internal consistency, never that the response came from the endpoint.
+_HASH_MATCH_NOTE = (
+    "The raw API response and its content_hash are internally consistent. "
+    "Both values come from the provider, so this does not show that the response "
+    "came from the attested endpoint. Do not treat it as independent verification."
+)
+_HASH_MISMATCH_NOTE = (
+    "WARNING: The computed hash does NOT match the claimed content_hash. "
+    "This is a strong signal the raw API response was altered or incorrectly recorded."
+)
+
 
 def build_evaluation_prompt(
     evidence_json: str,
@@ -162,8 +174,8 @@ def build_evaluation_prompt(
             is required regardless of ``mode``.
         hash_verification_result: Optional result from
             ``verify_verification_artifacts()`` — a programmatic SHA-256 check
-            performed before this LLM call.  Injected as an objective fact so
-            the LLM does not need to report hash-verification uncertainty.
+            performed before this LLM call.  A match shows internal consistency
+            only, because the provider supplies both values.
     """
     provenance_section = ""
     if provenance_result_json:
@@ -265,7 +277,7 @@ A SHA-256 hash check was performed by the mediator before this evaluation:
 - **Field hashed**: `verification_artifacts.{field}`
 - **Hash match**: {match}{endpoint_line}
 
-{"The provider's content hash is cryptographically verified. Do not penalise for hash uncertainty." if match else "WARNING: The computed hash does NOT match the claimed content_hash. This is a strong signal the raw API response was altered or incorrectly recorded."}
+{_HASH_MATCH_NOTE if match else _HASH_MISMATCH_NOTE}
 
 """
 
@@ -447,8 +459,8 @@ def build_digest_evaluation_prompt(
         mode: Optional scoring mode (``"training"`` / ``"production"``).
         task_type: Optional task type string.
         hash_verification_result: Optional result from
-            ``verify_verification_artifacts()`` — injected as an objective
-            fact so the LLM does not report hash-verification uncertainty.
+            ``verify_verification_artifacts()``.  A match shows internal
+            consistency only, because the provider supplies both values.
     """
     import json as _json
 
@@ -550,7 +562,7 @@ A SHA-256 hash check was performed by the mediator before this evaluation:
 - **Field hashed**: `verification_artifacts.{field}`
 - **Hash match**: {match}{endpoint_line}
 
-{"The provider's content hash is cryptographically verified. Do not penalise for hash uncertainty." if match else "WARNING: The computed hash does NOT match the claimed content_hash. This is a strong signal the raw API response was altered or incorrectly recorded."}
+{_HASH_MATCH_NOTE if match else _HASH_MISMATCH_NOTE}
 
 """
 

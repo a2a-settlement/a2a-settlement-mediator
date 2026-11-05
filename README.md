@@ -49,11 +49,11 @@ The most critical rule — **provenance tier selection**:
 |------|----------|-------------------|
 | `tier1 self_declared` | Generated/computed output, no external source | Plausibility only. No HTTP calls. |
 | `tier2 signed` | **Auth-gated APIs** (Bearer token, API key) | Hash format validation; 10% probabilistic HEAD check |
-| `tier3 verifiable` | **Public GET-able URLs only** (open web, GitHub API) | Live unauthenticated GET; HTTP 4xx = broken endpoint |
+| `tier3 verifiable` | **Public GET-able URLs only** (open web, GitHub API) | Live unauthenticated GET; 401/403 = unverified (tier mismatch); other 4xx = broken endpoint |
 
 Using `tier3 verifiable` for an authenticated endpoint causes the mediator to GET
-it without credentials, receive a 401, and flag the endpoint as broken — before
-the LLM reads a single line of the deliverable. Use `tier2 signed` for any A2A
+it without credentials, receive a 401, and mark the provenance unverified with a
+tier-mismatch flag — before the LLM reads a single line of the deliverable. Use `tier2 signed` for any A2A
 provider that requires authentication.
 
 The full guide (available at `GET /guide` on any running mediator instance) covers

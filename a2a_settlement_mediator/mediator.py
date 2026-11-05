@@ -658,7 +658,7 @@ def mediate(
 
     # 2e. Pre-LLM hash verification — check sha256(api_call_raw) == content_hash
     # if the deliverable contains a verification_artifacts block.  The LLM
-    # cannot recompute hashes; this injects an objective fact into the prompt.
+    # cannot recompute hashes; this puts the consistency result in the prompt.
     hash_verification_result = verify_verification_artifacts(delivered_content)
 
     # 2f. Size routing — if the evidence bundle exceeds the token budget, build

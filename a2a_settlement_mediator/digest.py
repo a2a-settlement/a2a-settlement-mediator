@@ -134,8 +134,9 @@ def verify_verification_artifacts(delivered_content: str | None) -> dict | None:
     ``verification_artifacts`` object.  The LLM cannot recompute hashes, so
     it reports "cannot verify" and applies a confidence penalty.  This
     function does the check in pure Python before the LLM is called and
-    returns a structured result that can be injected into the evidence bundle
-    as an objective fact.
+    returns a structured result for the evidence bundle.  The provider supplies
+    both fields, so a match proves consistency, not that the response came from
+    the endpoint; a mismatch is evidence of alteration.
 
     Looks for the following shape anywhere in the top-level deliverable JSON:
 

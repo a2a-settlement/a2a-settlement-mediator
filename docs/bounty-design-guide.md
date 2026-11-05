@@ -63,16 +63,15 @@ endpoint requiring authentication), use `tier2 signed`.** Never `tier3 verifiabl
 
 ### Why this matters
 
-With `tier3 verifiable`, the mediator does:
-```python
-resp = await client.get(uri)   # unauthenticated
-if resp.status_code >= 400:
-    flags.append("endpoint_error")   # treated as broken endpoint
-```
+With `tier3 verifiable`, the mediator makes an unauthenticated GET:
 
-An auth-gated API returns 401. The mediator flags it as broken. This gets injected
-into the LLM's evidence bundle as a provenance failure, degrading the LLM's
-confidence score before it reads a single line of the actual deliverable.
+- HTTP 401 or 403: nothing could be fetched or hashed, so provenance is **not
+  verified**. The result is flagged `tier_mismatch:auth_gated_source_use_signed_tier`
+  for review.
+- Any other 4xx or 5xx: treated as a broken endpoint, and provenance is rejected.
+
+Either way, the provenance problem goes into the LLM's evidence bundle, which lowers
+its confidence before it reads a single line of the actual deliverable.
 
 With `tier2 signed`, the mediator validates your hash format and does an optional
 HEAD check (which correctly treats 401 as "reachable, auth required" — not broken).
@@ -159,7 +158,11 @@ calls), structure the deliverable so the mediator's pre-LLM hash check activates
 
 When the mediator finds this structure, it computes `sha256(api_call_raw)` and
 compares it to `content_hash` in pure Python **before the LLM is called**. The
-LLM then receives: `"Programmatic hash verification: PASSED"` as an objective fact.
+LLM then receives the result as a fact instead of guessing at it.
+
+A match shows only that the two fields are consistent. You supply both, so it does
+not prove the response came from `endpoint_url`; authenticity comes from tier2
+signed provenance. A mismatch is a strong signal that the response was altered.
 
 Without this structure, the LLM sees `content_hash` and `api_call_raw` as opaque
 fields and says "cannot verify" — applying a confidence penalty every time.
@@ -257,7 +260,8 @@ programmatic hash verification result — not whether it recognises the API.
 Also ensure:
 - Provenance is set to `tier2 signed` (not `tier3 verifiable`)
 - `verification_artifacts` block is present in the deliverable (activates
-  the pre-LLM hash check, removing hash uncertainty from the LLM's scoring)
+  the pre-LLM consistency check, so the LLM doesn't have to guess whether the
+  hash matches)
 
 ---
 
