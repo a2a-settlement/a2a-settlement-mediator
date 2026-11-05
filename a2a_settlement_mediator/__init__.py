@@ -19,6 +19,8 @@ from a2a_settlement_mediator.settlement_pipeline import (
     mark_failed,
     settle,
 )
+from a2a_settlement_mediator.diff_policy_auditor import audit_diff
+from a2a_settlement_mediator.patch_assessor import assess_patch
 from a2a_settlement_mediator.worm_schemas import (
     AgentIdentity,
     AP2Mandate,
@@ -71,6 +73,9 @@ __all__ = [
     "SettlementResult",
     "SettlementStage",
     "TimestampToken",
+    # Patch assessment
+    "assess_patch",
+    "audit_diff",
 ]
 
 __version__ = "0.3.0"

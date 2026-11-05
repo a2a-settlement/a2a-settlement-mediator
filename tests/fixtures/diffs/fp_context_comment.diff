@@ -1,0 +1,10 @@
+diff --git a/src/app/run.py b/src/app/run.py
+index 1111111..2222222 100644
+--- a/src/app/run.py
++++ b/src/app/run.py
+@@ -1,4 +1,4 @@
+ def run(cmd):
+-    return subprocess.call(cmd)
++    return subprocess.call(cmd, shell=False)
+     # nosec B602 existing comment
+     return 0

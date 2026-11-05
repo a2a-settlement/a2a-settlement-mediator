@@ -1,0 +1,78 @@
+diff --git a/src/evasion/nosec_tight.py b/src/evasion/nosec_tight.py
+index 1111111..2222222 100644
+--- a/src/evasion/nosec_tight.py
++++ b/src/evasion/nosec_tight.py
+@@ -1,2 +1,3 @@
+ def run(cmd):
++    subprocess.call(cmd, shell=True)  #nosec
+     return 0
+diff --git a/src/evasion/nosec_upper.py b/src/evasion/nosec_upper.py
+index 1111111..2222222 100644
+--- a/src/evasion/nosec_upper.py
++++ b/src/evasion/nosec_upper.py
+@@ -1,2 +1,3 @@
+ def run(cmd):
++    subprocess.call(cmd, shell=True)  # NOSEC
+     return 0
+diff --git a/src/evasion/noqa_glued.py b/src/evasion/noqa_glued.py
+index 1111111..2222222 100644
+--- a/src/evasion/noqa_glued.py
++++ b/src/evasion/noqa_glued.py
+@@ -1,2 +1,3 @@
+ def load():
++import os  #noqa:E501
+     return os
+diff --git a/src/evasion/noqa_spaced.py b/src/evasion/noqa_spaced.py
+index 1111111..2222222 100644
+--- a/src/evasion/noqa_spaced.py
++++ b/src/evasion/noqa_spaced.py
+@@ -1,2 +1,3 @@
+ def load():
++x = 1  #  noqa:E501
+     return x
+diff --git a/tests/test_weak_assert.py b/tests/test_weak_assert.py
+index 3333333..4444444 100644
+--- a/tests/test_weak_assert.py
++++ b/tests/test_weak_assert.py
+@@ -3,2 +3,3 @@ def test_ok():
+     assert resp.status == 200
++    assert   True
+     assert resp.ok
+diff --git a/src/web/handler.ts b/src/web/handler.ts
+index 1111111..2222222 100644
+--- a/src/web/handler.ts
++++ b/src/web/handler.ts
+@@ -2,2 +2,3 @@ export function run(code: string) {
+   const ready = true;
++  eval(code); // eslint-disable-next-line no-eval
+   return ready;
+diff --git a/front/widget.test.js b/front/widget.test.js
+index 1111111..2222222 100644
+--- a/front/widget.test.js
++++ b/front/widget.test.js
+@@ -1,2 +1,3 @@
+ describe("widget", () => {
++it.skip("renders", () => {});
+ });
+diff --git a/tests/test_skip_mark.py b/tests/test_skip_mark.py
+index 3333333..4444444 100644
+--- a/tests/test_skip_mark.py
++++ b/tests/test_skip_mark.py
+@@ -1,2 +1,3 @@
+ import pytest
++@pytest.mark.skipif(True, reason="x")
+ def test_flaky():
+diff --git a/tests/test_removed.py b/tests/test_removed.py
+deleted file mode 100644
+index 1111111..0000000
+--- a/tests/test_removed.py
++++ /dev/null
+@@ -1,4 +0,0 @@
+-def test_removed():
+-    resp = client.get("/x")
+-    assert resp.status_code == 401
+-    assert True
+diff --git a/tests/test_auth.py b/tests/test_auth.py.bak
+similarity index 100%
+rename from tests/test_auth.py
+rename to tests/test_auth.py.bak

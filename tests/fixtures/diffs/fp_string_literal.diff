@@ -1,0 +1,18 @@
+diff --git a/src/app/msg.py b/src/app/msg.py
+index 1111111..2222222 100644
+--- a/src/app/msg.py
++++ b/src/app/msg.py
+@@ -1,2 +1,4 @@
+ def label():
++    message = "nosec"
++    note = "use # nosec here"
+     return message
+diff --git a/src/web/label.ts b/src/web/label.ts
+index 1111111..2222222 100644
+--- a/src/web/label.ts
++++ b/src/web/label.ts
+@@ -1,2 +1,4 @@
+ export function label() {
++  const note = "nosec"; // fine
++  const url = "http://nosec.example.com/a";
+   return note;

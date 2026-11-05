@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS compliance_queue (
 
 CREATE INDEX IF NOT EXISTS idx_compliance_queue_escrow ON compliance_queue(escrow_id);
 CREATE INDEX IF NOT EXISTS idx_compliance_queue_type ON compliance_queue(queue_type);
+
+CREATE TABLE IF NOT EXISTS patch_assessments (
+    assessment_key TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -219,3 +225,34 @@ def list_compliance_queue(
         ).fetchall()
 
     return [dict(r) for r in rows], total
+
+
+# ---------------------------------------------------------------------------
+# Patch assessments
+# ---------------------------------------------------------------------------
+
+
+def save_patch_assessment(assessment_key: str, assessment_json: str) -> None:
+    """Insert or replace a patch assessment.
+
+    The same key overwrites the previous row. Audit records stay append-only;
+    patch assessments are keyed for one current result per PR head and spec.
+    """
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO patch_assessments "
+            "(assessment_key, data, updated_at) VALUES (?, ?, datetime('now'))",
+            (assessment_key, assessment_json),
+        )
+
+
+def get_patch_assessment(assessment_key: str) -> Optional[dict]:
+    """Return the stored patch assessment for ``assessment_key``, if any."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT data FROM patch_assessments WHERE assessment_key = ?",
+            (assessment_key,),
+        ).fetchone()
+    if row:
+        return json.loads(row["data"])
+    return None

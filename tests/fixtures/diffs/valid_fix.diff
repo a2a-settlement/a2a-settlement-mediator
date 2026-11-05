@@ -1,0 +1,24 @@
+diff --git a/src/app/auth.py b/src/app/auth.py
+index 1111111..2222222 100644
+--- a/src/app/auth.py
++++ b/src/app/auth.py
+@@ -12,6 +12,8 @@ def login(user):
+     if not user:
+         raise AuthError("missing user")
+     token = issue(user)
++    if token is None:
++        raise AuthError("no token")
+     return token
+ 
+ 
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 3333333..4444444 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -20,3 +20,6 @@ def test_login_ok():
+     assert resp.status_code == 200
+ 
+ 
++def test_login_rejects_anon():
++    resp = client.get("/login")
++    assert resp.status_code == 401
