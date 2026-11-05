@@ -24,6 +24,8 @@ from a2a_settlement_mediator.webhook_listener import app
 
 _SECRET = "test-secret"
 _PATH = "/api/v1/verify-patch"
+_NOW = 1_700_000_000
+_TIMESTAMP = str(_NOW)
 
 
 @pytest.fixture
@@ -42,6 +44,11 @@ def client(tmp_path, monkeypatch, audit):
     monkeypatch.setattr(storage, "DB_PATH", str(tmp_path / "mediator.db"))
     storage.initialize_db()
     monkeypatch.setattr(settings, "webhook_secret", _SECRET)
+    monkeypatch.setattr(settings, "signature_tolerance_seconds", 300)
+    monkeypatch.setattr(
+        "a2a_settlement_mediator.webhook_listener._now",
+        lambda: float(_NOW),
+    )
 
     def _boom(**_kwargs):
         raise AssertionError("litellm.completion must not be called")
@@ -53,8 +60,9 @@ def client(tmp_path, monkeypatch, audit):
     return TestClient(app)
 
 
-def _sign(body: bytes, secret: str = _SECRET) -> str:
-    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+def _sign(body: bytes, secret: str = _SECRET, timestamp: str = _TIMESTAMP) -> str:
+    message = f"{timestamp}.".encode("ascii") + body
+    digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
 
 
@@ -71,10 +79,17 @@ def _body(**overrides) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
-def _post(client: TestClient, body: bytes, signature: str | None):
+def _post(
+    client: TestClient,
+    body: bytes,
+    signature: str | None,
+    timestamp: str | None = _TIMESTAMP,
+):
     headers = {"Content-Type": "application/json"}
     if signature is not None:
         headers["X-A2ASE-Signature"] = signature
+    if timestamp is not None:
+        headers["X-A2ASE-Timestamp"] = timestamp
     return client.post(_PATH, content=body, headers=headers)
 
 
@@ -150,10 +165,21 @@ def test_invalid_body_is_400(client):
 def test_repeated_request_overwrites(client):
     first_body = _body(git_diff="diff --git a/a.py b/a.py\n+first\n")
     second_body = _body(git_diff="diff --git a/a.py b/a.py\n+second\n")
-    # Identical replay, then a second body that maps to the same storage key.
+    # Distinct timestamps so these are not signature replays. The second diff
+    # shares the first body's storage key and overwrites that assessment.
     again = _post(client, first_body, _sign(first_body))
-    first = _post(client, first_body, _sign(first_body))
-    second = _post(client, second_body, _sign(second_body))
+    first = _post(
+        client,
+        first_body,
+        _sign(first_body, timestamp="1700000001"),
+        timestamp="1700000001",
+    )
+    second = _post(
+        client,
+        second_body,
+        _sign(second_body, timestamp="1700000002"),
+        timestamp="1700000002",
+    )
     assert again.status_code == 200
     assert first.status_code == 200
     assert second.status_code == 200
