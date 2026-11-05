@@ -1,0 +1,4 @@
+diff --git a/tests/test_auth.py b/tests/test_login.py
+similarity index 100%
+rename from tests/test_auth.py
+rename to tests/test_login.py

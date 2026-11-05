@@ -1,0 +1,8 @@
+diff --git a/scripts/x.sh b/scripts/x.sh
+index 1111111..2222222 100644
+--- a/scripts/x.sh
++++ b/scripts/x.sh
+@@ -1,2 +1,3 @@
+ #!/bin/sh
++echo hi
+ exit 0

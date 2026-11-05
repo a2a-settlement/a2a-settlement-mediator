@@ -1,0 +1,8 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1111111..2222222 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -8,2 +8,2 @@ jobs:
+     - name: test
+-      run: pytest
++      run: pytest -q
