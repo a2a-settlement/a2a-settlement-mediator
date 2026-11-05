@@ -235,6 +235,8 @@ class PolicyRule(str, Enum):
     PATH_NOT_ALLOWED = "path_not_allowed"
     LITERAL_RETURN_SUSPECT = "literal_return_suspect"
     REVIEWER_CONCERN = "reviewer_concern"
+    UNINSPECTABLE_CHANGE = "uninspectable_change"
+    REVIEWER_UNAVAILABLE = "reviewer_unavailable"
 
 
 DEFAULT_RULE_SEVERITY: dict[PolicyRule, FindingSeverity] = {
@@ -248,6 +250,8 @@ DEFAULT_RULE_SEVERITY: dict[PolicyRule, FindingSeverity] = {
     PolicyRule.PATH_NOT_ALLOWED: FindingSeverity.VIOLATION,
     PolicyRule.LITERAL_RETURN_SUSPECT: FindingSeverity.REVIEW,
     PolicyRule.REVIEWER_CONCERN: FindingSeverity.REVIEW,
+    PolicyRule.UNINSPECTABLE_CHANGE: FindingSeverity.REVIEW,
+    PolicyRule.REVIEWER_UNAVAILABLE: FindingSeverity.REVIEW,
 }
 
 

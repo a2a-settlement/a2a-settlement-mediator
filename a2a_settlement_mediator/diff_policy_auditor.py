@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 
 from a2a_settlement_mediator.schemas import PatchPolicy, PolicyFinding, PolicyRule
-from a2a_settlement_mediator.unified_diff import DiffLine, FileDiff, parse_unified_diff
+from a2a_settlement_mediator.unified_diff import DiffLine, FileDiff, parse_unified_diff_report
 
 _TEST_DIRS = frozenset({"tests", "test", "__tests__"})
 # A backup or doc renamed out of a test filename is not a test file, even when
@@ -59,8 +59,22 @@ _HARNESS_NAMES = frozenset(
         ".eslintignore",
         ".bandit",
         "codecov.yml",
+        ".pre-commit-config.yaml",
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "noxfile.py",
+        "justfile",
+        "Justfile",
+        "Taskfile.yml",
+        ".gitlab-ci.yml",
+        ".travis.yml",
+        "azure-pipelines.yml",
+        "Jenkinsfile",
+        "bitbucket-pipelines.yml",
     }
 )
+_HARNESS_DIRS = (".github/workflows", ".circleci", ".buildkite", ".github/actions")
 _HARNESS_SECTION_PREFIXES = (
     "[tool.pytest",
     "[tool.coverage",
@@ -219,14 +233,27 @@ def audit_diff(diff_text: str, policy: PatchPolicy) -> list[PolicyFinding]:
     """
 
     text = diff_text if isinstance(diff_text, str) else ""
-    files = parse_unified_diff(text)
+    report = parse_unified_diff_report(text)
+    files = report.files
     findings: list[PolicyFinding] = []
     manifest_names: set[str] = set()
     disallowed: set[str] = set()
     lockfiles: list[FileDiff] = []
     allowed = _allowset(policy)
 
+    # Content the parser could not attribute to a file was not audited.
+    unparsed = None
+    if report.problems:
+        unparsed = "malformed diff: " + "; ".join(report.problems[:5])
+        if len(report.problems) > 5:
+            unparsed += f"; and {len(report.problems) - 5} more"
+    elif text.strip() and not files:
+        unparsed = "diff contains no file changes"
+    if unparsed is not None:
+        findings.append(_finding(policy, PolicyRule.UNINSPECTABLE_CHANGE, "", None, unparsed))
+
     for fd in files:
+        findings.extend(_uninspectable_findings(fd, policy, allowed))
         findings.extend(_structural_findings(fd, policy))
         findings.extend(_content_findings(fd, policy))
         if _basename(_primary_path(fd)) in _LOCKFILES:
@@ -334,7 +361,7 @@ def _is_plain_harness(path: str) -> bool:
     base = posixpath.basename(norm)
     if norm == "conftest.py":
         return True
-    if norm == ".github/workflows" or norm.startswith(".github/workflows/"):
+    if any(norm == root or norm.startswith(root + "/") for root in _HARNESS_DIRS):
         return True
     if base in _HARNESS_NAMES:
         return True
@@ -367,6 +394,43 @@ def _pyproject_touches_harness(fd: FileDiff) -> bool:
             if line.kind in "+-" and section is not None and _is_harness_section(section):
                 return True
     return False
+
+
+def _is_canonical_path(path: str) -> bool:
+    """A repository-relative POSIX path with no empty, ``.``, or ``..`` parts."""
+    if not path or path.startswith("/") or "\\" in path:
+        return False
+    if any(ord(char) < 0x20 for char in path):
+        return False
+    return all(part not in ("", ".", "..") for part in path.split("/"))
+
+
+def _uninspectable_findings(
+    fd: FileDiff, policy: PatchPolicy, allowed: set[str]
+) -> list[PolicyFinding]:
+    """Changes whose effect the line rules cannot see."""
+    findings: list[PolicyFinding] = []
+    path = _primary_path(fd)
+    for candidate in (fd.old_path, fd.new_path):
+        if candidate is not None and not _is_canonical_path(candidate):
+            findings.append(
+                _finding(
+                    policy,
+                    PolicyRule.PATH_NOT_ALLOWED,
+                    candidate,
+                    None,
+                    "non-canonical path",
+                )
+            )
+    if fd.status == "binary":
+        findings.append(
+            _finding(policy, PolicyRule.UNINSPECTABLE_CHANGE, path, None, "binary change")
+        )
+    if fd.submodule and _normalize_pkg(_basename(path)) not in allowed:
+        findings.append(
+            _finding(policy, PolicyRule.DEPENDENCY_CHANGED, path, None, "submodule changed")
+        )
+    return findings
 
 
 def _structural_findings(fd: FileDiff, policy: PatchPolicy) -> list[PolicyFinding]:
@@ -789,10 +853,20 @@ _DEP_LIKE_PATTERNS = (
     re.compile(r"""^\s*"(?P<key>@?[A-Za-z0-9][\w.\-/]*)"\s*:\s*"[\^~>=<*]?\s*\d"""),
     re.compile(r"""^\s*(?P<key>[A-Za-z0-9][\w\-]*)\s*=\s*("[\^~>=<*]?\s*\d|\{[^}]*version)"""),
 )
+# Entries whose value is not a numeric version: a tag, URL, path, or workspace
+# reference may still be a dependency.
+_ENTRY_PATTERNS = (
+    re.compile(r"""^\s*"(?P<key>@?[A-Za-z0-9][\w.\-/]*)"\s*:\s*\S"""),
+    re.compile(r"""^\s*(?P<key>[A-Za-z0-9][\w.\-]*)\s*=\s*\S"""),
+    re.compile(r"""^\s*["'](?P<key>[A-Za-z0-9][A-Za-z0-9_.\-]*)"""),
+)
+_JSON_OPEN_RE = re.compile(r'^\s*"[^"]+"\s*:\s*[\[{]')
 
 
-def _dependency_like_name(text: str) -> str | None:
-    for pattern in _DEP_LIKE_PATTERNS:
+def _dependency_like_name(
+    text: str, patterns: tuple[re.Pattern[str], ...] = _DEP_LIKE_PATTERNS
+) -> str | None:
+    for pattern in patterns:
         match = pattern.match(text)
         if match is None:
             continue
@@ -827,6 +901,28 @@ def _unclassified_manifest_findings(
                 f"unclassified manifest change: {line.text.strip()[:200]}",
             )
         ]
+    # A changed entry with no section or object header above it in its hunk
+    # cannot be shown to be outside a dependency table.
+    for hunk in fd.hunks:
+        attributed = False
+        for line in hunk.lines:
+            if _section_header(line.text) is not None or _JSON_OPEN_RE.match(line.text):
+                attributed = True
+                continue
+            if attributed or line.kind not in "+-":
+                continue
+            name = _dependency_like_name(line.text, _ENTRY_PATTERNS)
+            if name is None or _normalize_pkg(name) in allowed:
+                continue
+            return [
+                _finding(
+                    policy,
+                    PolicyRule.UNINSPECTABLE_CHANGE,
+                    path,
+                    _lineno(line),
+                    f"manifest entry outside a visible section: {line.text.strip()[:200]}",
+                )
+            ]
     return []
 
 

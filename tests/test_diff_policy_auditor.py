@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,13 @@ def run(diff: str, policy: PatchPolicy | None = None) -> list:
 
 
 def _hunk(path: str, lines: list[str], header: str = "@@ -1,1 +1,2 @@") -> str:
+    """Build a one-hunk diff. Header line counts are recomputed from ``lines``."""
     body = "\n".join(lines) + "\n"
+    starts = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$", header)
+    if starts is not None:
+        old = sum(1 for line in lines if not line.startswith(("+", "\\")))
+        new = sum(1 for line in lines if not line.startswith(("-", "\\")))
+        header = f"@@ -{starts.group(1)},{old} +{starts.group(2)},{new} @@{starts.group(3)}"
     return (
         f"diff --git a/{path} b/{path}\n"
         f"--- a/{path}\n"
@@ -238,7 +245,93 @@ def test_findings_are_deterministic_and_ordered():
 def test_empty_and_malformed_diffs():
     assert run("") == []
     assert run("   \n") == []
-    assert run("this is not a diff\n@@ -1 +1 @@\n+hello\n") == []
+    malformed = run("this is not a diff\n@@ -1 +1 @@\n+hello\n")
+    assert [f.rule for f in malformed] == [PolicyRule.UNINSPECTABLE_CHANGE]
+    assert malformed[0].severity == FindingSeverity.REVIEW
+
+
+def test_truncated_hunk_is_uninspectable():
+    diff = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        " a = 1\n"
+        "+b = 2\n"
+    )
+    findings = run(diff)
+    assert [f.rule for f in findings] == [PolicyRule.UNINSPECTABLE_CHANGE]
+    assert "hunk length" in findings[0].evidence
+
+
+def test_trailing_garbage_after_hunk_is_uninspectable():
+    diff = _hunk("src/app.py", [" a = 1", "+b = 2"], "@@ -1,1 +1,2 @@") + "rm -rf /\n"
+    assert [f.rule for f in run(diff)] == [PolicyRule.UNINSPECTABLE_CHANGE]
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Binary files a/tests/test_auth.py and b/tests/test_auth.py differ",
+        "GIT binary patch\nliteral 1\nA",
+    ],
+)
+def test_binary_test_change_is_uninspectable(header):
+    diff = (
+        "diff --git a/tests/test_auth.py b/tests/test_auth.py\n"
+        "index 1111111..2222222 100644\n"
+        f"{header}\n"
+    )
+    assert PolicyRule.UNINSPECTABLE_CHANGE in [f.rule for f in run(diff)]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["src/../.github/workflows/ci.yml", "/etc/passwd", "src//app.py", "./src/app.py"],
+)
+def test_non_canonical_path_is_not_allowed(path):
+    diff = _hunk(path, ["-x = 1", "+x = 2"], "@@ -1,1 +1,1 @@")
+    findings = run(diff, PatchPolicy(allowed_paths=["**"]))
+    assert PolicyRule.PATH_NOT_ALLOWED in [f.rule for f in findings]
+    assert all(
+        f.severity == FindingSeverity.VIOLATION
+        for f in findings
+        if f.rule == PolicyRule.PATH_NOT_ALLOWED
+    )
+
+
+def test_submodule_bump_is_dependency_change():
+    diff = (
+        "diff --git a/vendor/lib b/vendor/lib\n"
+        "index 1111111..2222222 160000\n"
+        "--- a/vendor/lib\n"
+        "+++ b/vendor/lib\n"
+        "@@ -1 +1 @@\n"
+        "-Subproject commit 1111111111111111111111111111111111111111\n"
+        "+Subproject commit 2222222222222222222222222222222222222222\n"
+    )
+    assert [f.rule for f in run(diff)] == [PolicyRule.DEPENDENCY_CHANGED]
+    assert run(diff, PatchPolicy(allowed_dependency_changes=["lib"])) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".pre-commit-config.yaml", "Makefile", "noxfile.py", ".gitlab-ci.yml", ".circleci/config.yml"],
+)
+def test_build_and_ci_files_are_harness(path):
+    diff = _hunk(path, ["-run: pytest -q", "+run: true"], "@@ -1,1 +1,1 @@")
+    assert PolicyRule.HARNESS_CHANGED in [f.rule for f in run(diff)]
+
+
+def test_package_json_non_numeric_version_without_section_needs_review():
+    diff = _hunk(
+        "package.json",
+        ['  "react": "^18.2.0",', '+ "left-pad": "latest",', '  "zod": "^3.22.0"'],
+        "@@ -40,2 +40,3 @@",
+    )
+    findings = run(diff)
+    assert [f.rule for f in findings] == [PolicyRule.UNINSPECTABLE_CHANGE]
+    assert run(diff, PatchPolicy(allowed_dependency_changes=["left-pad"])) == []
 
 
 def test_crlf_diff_still_detects_nosec():
@@ -508,10 +601,21 @@ def test_pyproject_ruff_section_is_harness():
     assert [item.rule for item in findings] == [PolicyRule.HARNESS_CHANGED]
 
 
-def test_pyproject_unknown_section_is_clean():
+def test_pyproject_entry_without_visible_section_needs_review():
     diff = _hunk(
         "pyproject.toml",
         [" timeout = 30", "+retries = 5", " workers = 2"],
+        "@@ -40,2 +40,3 @@",
+    )
+    findings = run(diff)
+    assert [f.rule for f in findings] == [PolicyRule.UNINSPECTABLE_CHANGE]
+    assert findings[0].severity == FindingSeverity.REVIEW
+
+
+def test_pyproject_unknown_visible_section_is_clean():
+    diff = _hunk(
+        "pyproject.toml",
+        [" [tool.myapp]", " timeout = 30", "+retries = 5"],
         "@@ -40,2 +40,3 @@",
     )
     assert run(diff) == []
@@ -777,10 +881,12 @@ index 1111111..2222222 100644
 Binary files a/assets/logo.bin and b/assets/logo.bin differ
 """
     findings = run(diff, PatchPolicy(allowed_paths=["src/**"]))
-    assert len(findings) == 1
-    assert findings[0].rule == PolicyRule.PATH_NOT_ALLOWED
+    assert [f.rule for f in findings] == [
+        PolicyRule.PATH_NOT_ALLOWED,
+        PolicyRule.UNINSPECTABLE_CHANGE,
+    ]
     assert findings[0].path == "assets/logo.bin"
-    assert run(diff) == []
+    assert [f.rule for f in run(diff)] == [PolicyRule.UNINSPECTABLE_CHANGE]
 
 
 def test_new_test_file_with_real_assertion_is_clean():
@@ -834,7 +940,7 @@ def test_package_json_dependency_without_visible_section_is_flagged():
     diff = """diff --git a/package.json b/package.json
 --- a/package.json
 +++ b/package.json
-@@ -40,6 +40,7 @@
+@@ -40,5 +40,6 @@
      "react": "^18.2.0",
      "react-dom": "^18.2.0",
 +    "left-pad": "^1.3.0",

@@ -1,6 +1,7 @@
 """Parse ``git diff`` unified output into file, hunk, and line records.
 
-Malformed regions are skipped. An empty diff yields an empty list. Paths from
+Malformed regions are skipped by ``parse_unified_diff`` and reported by
+``parse_unified_diff_report``. An empty diff yields an empty list. Paths from
 ``diff --git a/... b/...`` headers lose the ``a/`` and ``b/`` prefixes only.
 """
 
@@ -12,6 +13,7 @@ from typing import Literal
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_GIT = "diff --git "
+_SUBMODULE_MODE = "160000"
 
 
 @dataclass
@@ -51,37 +53,59 @@ class FileDiff:
     new_path: str | None
     status: Literal["added", "deleted", "modified", "renamed", "binary"]
     hunks: list[Hunk]
+    submodule: bool = False
+
+
+@dataclass
+class DiffReport:
+    """Parsed files plus descriptions of input the parser could not account for."""
+
+    files: list[FileDiff]
+    problems: list[str]
 
 
 def parse_unified_diff(diff_text: str) -> list[FileDiff]:
     """Parse unified diff text. Never raises on malformed input."""
 
+    return parse_unified_diff_report(diff_text).files
+
+
+def parse_unified_diff_report(diff_text: str) -> DiffReport:
+    """Parse unified diff text and report unparsed content. Never raises."""
+
     if not isinstance(diff_text, str) or not diff_text.strip():
-        return []
+        return DiffReport([], [])
     text = diff_text.replace("\r\n", "\n").replace("\r", "\n")
     if text.startswith("\ufeff"):
         text = text[1:]
     lines = text.splitlines()
     files: list[FileDiff] = []
+    problems: list[str] = []
     index = 0
     total = len(lines)
     while index < total:
         if not lines[index].startswith(_DIFF_GIT):
+            if lines[index].strip():
+                problems.append(f"line {index + 1}: content outside a file section")
             index += 1
             continue
         try:
-            parsed, index = _parse_file(lines, index)
+            parsed, index = _parse_file(lines, index, problems)
         except Exception:
+            problems.append(f"line {index + 1}: file section could not be parsed")
             index += 1
             continue
         if parsed is not None:
             files.append(parsed)
-    return files
+    return DiffReport(files, problems)
 
 
-def _parse_file(lines: list[str], start: int) -> tuple[FileDiff | None, int]:
+def _parse_file(
+    lines: list[str], start: int, problems: list[str]
+) -> tuple[FileDiff | None, int]:
     pair = _split_diff_git(lines[start])
     if pair is None:
+        problems.append(f"line {start + 1}: unreadable diff --git header")
         return None, start + 1
     old_path, new_path = pair
     index = start + 1
@@ -90,6 +114,7 @@ def _parse_file(lines: list[str], start: int) -> tuple[FileDiff | None, int]:
     is_deleted = False
     is_rename = False
     is_binary = False
+    is_submodule = False
 
     while index < total:
         line = lines[index]
@@ -108,6 +133,10 @@ def _parse_file(lines: list[str], start: int) -> tuple[FileDiff | None, int]:
                 old_path, new_path = left, right
             index += 1
             break
+        if _SUBMODULE_MODE in line.split() and line.startswith(
+            ("index ", "new file mode ", "deleted file mode ", "old mode ", "new mode ")
+        ):
+            is_submodule = True
         if line.startswith("new file mode "):
             is_new = True
         elif line.startswith("deleted file mode "):
@@ -127,9 +156,14 @@ def _parse_file(lines: list[str], start: int) -> tuple[FileDiff | None, int]:
     hunks: list[Hunk] = []
     if not is_binary:
         while index < total and lines[index].startswith("@@"):
-            hunk, index = _parse_hunk(lines, index)
-            if hunk is not None:
-                hunks.append(hunk)
+            hunk_start = index
+            hunk, index, counts_match = _parse_hunk(lines, index)
+            if hunk is None:
+                problems.append(f"line {hunk_start + 1}: unreadable hunk header")
+                continue
+            if not counts_match:
+                problems.append(f"line {hunk_start + 1}: hunk length does not match header")
+            hunks.append(hunk)
 
     if is_binary:
         status: Literal["added", "deleted", "modified", "renamed", "binary"] = "binary"
@@ -145,14 +179,21 @@ def _parse_file(lines: list[str], start: int) -> tuple[FileDiff | None, int]:
         status = "modified"
 
     if old_path is None and new_path is None:
+        problems.append(f"line {start + 1}: file section has no path")
         return None, index
-    return FileDiff(old_path, new_path, status, hunks), index
+    for hunk in hunks:
+        if any(item.text.startswith("Subproject commit ") for item in hunk.lines):
+            is_submodule = True
+    return FileDiff(old_path, new_path, status, hunks, is_submodule), index
 
 
-def _parse_hunk(lines: list[str], start: int) -> tuple[Hunk | None, int]:
+def _parse_hunk(lines: list[str], start: int) -> tuple[Hunk | None, int, bool]:
+    """Return the hunk, the next index, and whether body length matches the header."""
     match = _HUNK_RE.match(lines[start])
     if not match:
-        return None, start + 1
+        return None, start + 1, False
+    old_count = int(match.group(2)) if match.group(2) is not None else 1
+    new_count = int(match.group(4)) if match.group(4) is not None else 1
     old_ln = int(match.group(1))
     new_ln = int(match.group(3))
     index = start + 1
@@ -178,7 +219,10 @@ def _parse_hunk(lines: list[str], start: int) -> tuple[Hunk | None, int]:
         else:
             break
         index += 1
-    return Hunk(int(match.group(1)), int(match.group(3)), body), index
+    old_seen = sum(1 for item in body if item.kind != "+")
+    new_seen = sum(1 for item in body if item.kind != "-")
+    counts_match = old_seen == old_count and new_seen == new_count
+    return Hunk(int(match.group(1)), int(match.group(3)), body), index, counts_match
 
 
 def _split_diff_git(line: str) -> tuple[str, str] | None:

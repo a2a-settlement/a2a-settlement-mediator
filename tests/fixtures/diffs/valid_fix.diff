@@ -15,7 +15,7 @@ diff --git a/tests/test_auth.py b/tests/test_auth.py
 index 3333333..4444444 100644
 --- a/tests/test_auth.py
 +++ b/tests/test_auth.py
-@@ -20,3 +20,7 @@ def test_login_ok():
+@@ -20,3 +20,6 @@ def test_login_ok():
      assert resp.status_code == 200
  
  

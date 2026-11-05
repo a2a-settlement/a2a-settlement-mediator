@@ -188,20 +188,21 @@ def test_reviewer_concerns_on_clean_diff_need_review(audit):
     assert finding.source == "reviewer"
 
 
-def test_reviewer_exception_uses_deterministic_outcome(audit):
+def test_reviewer_exception_fails_closed(audit):
     def _boom(_prompt: str) -> str:
         raise RuntimeError("reviewer down")
 
     clean = assess_patch(_request(), llm_call=_boom)
     assert clean.reviewer_opinion.status == "unavailable"
-    assert clean.outcome == PatchOutcome.ACCEPTABLE
-    assert clean.findings == []
+    assert clean.outcome == PatchOutcome.NEEDS_REVIEW
+    assert [f.rule for f in clean.findings] == [PolicyRule.REVIEWER_UNAVAILABLE]
 
     audit["findings"] = [_finding()]
     reviewed = assess_patch(_request(), llm_call=_boom)
     assert reviewed.reviewer_opinion.status == "unavailable"
     assert reviewed.outcome == PatchOutcome.NEEDS_REVIEW
-    assert reviewed.findings == audit["findings"]
+    assert reviewed.findings[0] == audit["findings"][0]
+    assert reviewed.findings[1].rule == PolicyRule.REVIEWER_UNAVAILABLE
 
 
 @pytest.mark.parametrize(
@@ -218,8 +219,8 @@ def test_reviewer_exception_uses_deterministic_outcome(audit):
 def test_unparseable_reviewer_is_unavailable(audit, raw):
     result = assess_patch(_request(), llm_call=lambda _prompt: raw)
     assert result.reviewer_opinion.status == "unavailable"
-    assert result.outcome == PatchOutcome.ACCEPTABLE
-    assert result.findings == []
+    assert result.outcome == PatchOutcome.NEEDS_REVIEW
+    assert [f.rule for f in result.findings] == [PolicyRule.REVIEWER_UNAVAILABLE]
 
 
 def test_reviewer_cannot_remove_deterministic_finding(audit):

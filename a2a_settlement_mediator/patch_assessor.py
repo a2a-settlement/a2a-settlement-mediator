@@ -96,7 +96,7 @@ def _run_reviewer(
     findings: list[PolicyFinding],
     llm_call: Callable[[str], str] | None,
 ) -> tuple[ReviewerOpinion, list[PolicyFinding]]:
-    """Run the advisory reviewer. Failures add no findings."""
+    """Run the advisory reviewer. A failure adds a REVIEWER_UNAVAILABLE finding."""
     reported_model = None if llm_call is not None else settings.llm_model
     call = llm_call or _default_llm_call
     try:
@@ -109,7 +109,14 @@ def _run_reviewer(
             req.pr_number,
             exc,
         )
-        return ReviewerOpinion(status="unavailable", model=reported_model), []
+        unavailable = PolicyFinding(
+            rule=PolicyRule.REVIEWER_UNAVAILABLE,
+            severity=req.policy.severity_for(PolicyRule.REVIEWER_UNAVAILABLE),
+            path="",
+            evidence="requested reviewer did not return a usable opinion",
+            source="deterministic",
+        )
+        return ReviewerOpinion(status="unavailable", model=reported_model), [unavailable]
 
     severity = req.policy.severity_for(PolicyRule.REVIEWER_CONCERN)
     extra = [
