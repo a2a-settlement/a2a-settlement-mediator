@@ -14,7 +14,7 @@ from collections.abc import Callable
 
 import litellm
 
-from a2a_settlement_mediator.config import settings
+from a2a_settlement_mediator.config import settings, temperature_kwargs
 from a2a_settlement_mediator.diff_policy_auditor import audit_diff
 from a2a_settlement_mediator.prompts import (
     PATCH_REVIEW_SYSTEM_PROMPT,
@@ -146,7 +146,7 @@ def _default_llm_call(prompt: str) -> str:
             {"role": "system", "content": PATCH_REVIEW_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        temperature=settings.llm_temperature,
+        **temperature_kwargs(),
         max_tokens=settings.llm_max_tokens,
         timeout=settings.llm_timeout_seconds,
     )

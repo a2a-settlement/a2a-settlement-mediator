@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 import litellm
 
-from a2a_settlement_mediator.config import settings
+from a2a_settlement_mediator.config import settings, temperature_kwargs
 from a2a_settlement_mediator.digest import (
     build_digest,
     check_deliverable_integrity,
@@ -134,7 +134,7 @@ def _call_llm(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=settings.llm_temperature,
+        **temperature_kwargs(),
         max_tokens=settings.llm_max_tokens,
         timeout=settings.llm_timeout_seconds,
     )
@@ -200,7 +200,7 @@ def _call_llm_digest(
             {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=settings.llm_temperature,
+        **temperature_kwargs(),
         max_tokens=settings.llm_max_tokens,
         timeout=settings.llm_timeout_seconds,
     )

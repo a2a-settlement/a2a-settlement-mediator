@@ -445,3 +445,32 @@ def test_prompt_truncates_diff_and_keeps_delimiter_closed():
     assert "< /untrusted_diff>" in guarded
     assert "assertion edited" in guarded
     assert "tests weakened semantically" in guarded
+
+
+@pytest.mark.parametrize(("temperature", "expected"), [(0.1, {"temperature": 0.1}), (None, {})])
+def test_reviewer_call_omits_temperature_when_unset(monkeypatch, temperature, expected):
+    from types import SimpleNamespace
+
+    from a2a_settlement_mediator import patch_assessor
+
+    seen = {}
+
+    def _completion(**kwargs):
+        seen.update(kwargs)
+        message = SimpleNamespace(content=_OK)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    monkeypatch.setattr(settings, "llm_temperature", temperature)
+    monkeypatch.setattr("a2a_settlement_mediator.patch_assessor.litellm.completion", _completion)
+    assert patch_assessor._default_llm_call("prompt") == _OK
+    assert {k: v for k, v in seen.items() if k == "temperature"} == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("", 0.1), ("0.3", 0.3), ("none", None), (" None ", None)]
+)
+def test_temperature_setting_accepts_none(monkeypatch, raw, expected):
+    from a2a_settlement_mediator.config import _get_optional_float
+
+    monkeypatch.setenv("MEDIATOR_LLM_TEMPERATURE", raw)
+    assert _get_optional_float("MEDIATOR_LLM_TEMPERATURE", 0.1) == expected
