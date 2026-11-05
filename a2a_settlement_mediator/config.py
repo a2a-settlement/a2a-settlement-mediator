@@ -24,6 +24,16 @@ def _get_float(name: str, default: float) -> float:
     return float(val)
 
 
+def _get_optional_float(name: str, default: float) -> float | None:
+    """Like _get_float, but "none" means the setting is not sent at all."""
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    if val.strip().lower() == "none":
+        return None
+    return float(val)
+
+
 def _get_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
     if val is None or val == "":
@@ -41,7 +51,8 @@ class MediatorSettings:
     llm_model_sonnet: str = os.getenv(
         "MEDIATOR_LLM_MODEL_SONNET", "anthropic/claude-sonnet-4-20250514"
     )
-    llm_temperature: float = _get_float("MEDIATOR_LLM_TEMPERATURE", 0.1)
+    # Set to "none" for models that reject a temperature (Claude 5.x).
+    llm_temperature: float | None = _get_optional_float("MEDIATOR_LLM_TEMPERATURE", 0.1)
     llm_max_tokens: int = _get_int("MEDIATOR_LLM_MAX_TOKENS", 4096)
 
     # --- Anti-self-dealing ---
@@ -122,3 +133,10 @@ class MediatorSettings:
 
 
 settings = MediatorSettings()
+
+
+def temperature_kwargs() -> dict[str, float]:
+    """The temperature argument for litellm.completion, or nothing when unset."""
+    if settings.llm_temperature is None:
+        return {}
+    return {"temperature": settings.llm_temperature}

@@ -27,7 +27,7 @@ from a2a_settlement_mediator.arbitration_prompts import (
     ARBITRATION_SYSTEM_PROMPT,
     build_arbitration_prompt,
 )
-from a2a_settlement_mediator.config import settings
+from a2a_settlement_mediator.config import settings, temperature_kwargs
 from a2a_settlement_mediator.merkle import MerkleTree
 from a2a_settlement_mediator.tsa_client import (
     RFC3161Client,
@@ -239,7 +239,7 @@ def _call_arbitration_llm(request: ArbitrationRequest) -> ArbitrationVerdict:
             {"role": "system", "content": ARBITRATION_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=settings.llm_temperature,
+        **temperature_kwargs(),
         max_tokens=settings.llm_max_tokens,
         timeout=settings.llm_timeout_seconds,
     )

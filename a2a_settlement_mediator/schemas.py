@@ -173,7 +173,7 @@ class MediatorContext(BaseModel):
 
     model_version: str
     system_prompt_hash: str
-    temperature: float
+    temperature: float | None
     max_tokens: int
 
 
