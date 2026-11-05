@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS patch_assessments (
     data TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS verify_patch_signatures (
+    signature TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
 """
 
 
@@ -256,3 +261,30 @@ def get_patch_assessment(assessment_key: str) -> Optional[dict]:
     if row:
         return json.loads(row["data"])
     return None
+
+
+# ---------------------------------------------------------------------------
+# Verify-patch replay cache
+# ---------------------------------------------------------------------------
+
+
+def remember_patch_signature(signature: str, expires_at: float, now: float) -> bool:
+    """Record a verified verify-patch signature until ``expires_at``.
+
+    Deletes rows with ``expires_at < now``, then inserts ``signature``.
+    Returns True when the row is new and False when it already exists.
+    The delete is committed even when the insert conflicts.
+    """
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM verify_patch_signatures WHERE expires_at < ?",
+            (now,),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO verify_patch_signatures (signature, expires_at) VALUES (?, ?)",
+                (signature, expires_at),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True

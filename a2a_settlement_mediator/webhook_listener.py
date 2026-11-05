@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -119,17 +120,27 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     return hmac.compare_digest(expected_sig, signature)
 
 
-def _verify_patch_signature(body: bytes, signature: str | None) -> bool:
-    """Verify HMAC-SHA256 for verify-patch. Fail closed when unconfigured.
+def _now() -> float:
+    return time.time()
 
-    ``_verify_signature`` succeeds when no webhook secret is set. Payment
-    checks must refuse that path instead of skipping verification.
+
+def _verify_patch_signature(
+    body: bytes, timestamp: str, signature: str | None
+) -> str | None:
+    """Return the verified signature hex, or None.
+
+    The signed message is the timestamp header, a literal ``.``, then the raw
+    body. Fail closed when unconfigured: ``_verify_signature`` succeeds when
+    no webhook secret is set, and payment checks must refuse that path.
     """
     secret = settings.webhook_secret
     if not secret or not signature:
-        return False
-    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature)
+        return None
+    message = f"{timestamp}.".encode("ascii") + body
+    expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(f"sha256={expected}", signature):
+        return None
+    return expected
 
 
 # ---------------------------------------------------------------------------
@@ -502,11 +513,14 @@ def _patch_assessment_key(req: VerifyPatchRequest) -> str:
 async def verify_patch(
     request: Request,
     x_a2ase_signature: str | None = Header(default=None),
+    x_a2ase_timestamp: str | None = Header(default=None),
 ):
     """Assess a PR diff against a frozen patch policy.
 
-    Requires ``X-A2ASE-Signature: sha256=<hex>`` over the raw body. An empty
-    webhook secret refuses the request instead of skipping verification.
+    Requires ``X-A2ASE-Timestamp`` (unix seconds) and
+    ``X-A2ASE-Signature: sha256=<hex>`` over ``{timestamp}.{raw body}``.
+    An empty webhook secret refuses the request. A verified signature is
+    accepted only once inside its timestamp window.
     """
     if not settings.webhook_secret:
         logger.warning("verify-patch refused because MEDIATOR_WEBHOOK_SECRET is empty")
@@ -515,9 +529,40 @@ async def verify_patch(
             detail="verify-patch requires MEDIATOR_WEBHOOK_SECRET",
         )
 
-    body = await request.body()
-    if not _verify_patch_signature(body, x_a2ase_signature):
+    if (
+        not x_a2ase_timestamp
+        or not x_a2ase_timestamp.isascii()
+        or not x_a2ase_timestamp.isdigit()
+        or len(x_a2ase_timestamp) > 12
+        or not x_a2ase_signature
+    ):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    now = _now()
+    timestamp = int(x_a2ase_timestamp)
+    tolerance = settings.signature_tolerance_seconds
+    # Values that do not fit in a float are outside any finite window.
+    try:
+        outside = abs(now - timestamp) > tolerance
+    except OverflowError:
+        outside = True
+    if outside:
+        raise HTTPException(
+            status_code=401,
+            detail="Signature timestamp outside the allowed window",
+        )
+
+    body = await request.body()
+    signature_hex = _verify_patch_signature(body, x_a2ase_timestamp, x_a2ase_signature)
+    if signature_hex is None:
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # timestamp + tolerance still covers every later `now` that would accept it.
+    fresh = storage.remember_patch_signature(
+        signature_hex, float(timestamp + tolerance), now
+    )
+    if not fresh:
+        raise HTTPException(status_code=409, detail="Replayed request")
 
     try:
         req = VerifyPatchRequest.model_validate_json(body)
