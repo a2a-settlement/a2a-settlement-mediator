@@ -111,5 +111,9 @@ class MediatorSettings:
     # Maximum number of conditions per mandate.
     max_conditions_per_mandate: int = _get_int("MEDIATOR_MAX_CONDITIONS_PER_MANDATE", 20)
 
+    # --- Patch assessment ---
+    # Maximum UTF-8 size of a git diff accepted by POST /api/v1/verify-patch.
+    max_patch_diff_bytes: int = _get_int("MEDIATOR_MAX_PATCH_DIFF_BYTES", 524288)
+
 
 settings = MediatorSettings()
