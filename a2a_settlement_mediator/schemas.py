@@ -212,3 +212,117 @@ class WebhookPayload(BaseModel):
     event: str
     timestamp: str
     data: dict
+
+
+# ---------------------------------------------------------------------------
+# Patch assessment (GitHub bounty diffs)
+# ---------------------------------------------------------------------------
+
+
+class FindingSeverity(str, Enum):
+    VIOLATION = "violation"
+    REVIEW = "review"
+
+
+class PolicyRule(str, Enum):
+    TEST_FILE_DELETED = "test_file_deleted"
+    ASSERTION_CHANGED = "assertion_changed"
+    WEAK_ASSERTION_ADDED = "weak_assertion_added"
+    TEST_SKIP_ADDED = "test_skip_added"
+    SUPPRESSION_ADDED = "suppression_added"
+    HARNESS_CHANGED = "harness_changed"
+    DEPENDENCY_CHANGED = "dependency_changed"
+    PATH_NOT_ALLOWED = "path_not_allowed"
+    LITERAL_RETURN_SUSPECT = "literal_return_suspect"
+    REVIEWER_CONCERN = "reviewer_concern"
+
+
+DEFAULT_RULE_SEVERITY: dict[PolicyRule, FindingSeverity] = {
+    PolicyRule.TEST_FILE_DELETED: FindingSeverity.REVIEW,
+    PolicyRule.ASSERTION_CHANGED: FindingSeverity.REVIEW,
+    PolicyRule.WEAK_ASSERTION_ADDED: FindingSeverity.REVIEW,
+    PolicyRule.TEST_SKIP_ADDED: FindingSeverity.REVIEW,
+    PolicyRule.SUPPRESSION_ADDED: FindingSeverity.REVIEW,
+    PolicyRule.HARNESS_CHANGED: FindingSeverity.VIOLATION,
+    PolicyRule.DEPENDENCY_CHANGED: FindingSeverity.VIOLATION,
+    PolicyRule.PATH_NOT_ALLOWED: FindingSeverity.VIOLATION,
+    PolicyRule.LITERAL_RETURN_SUSPECT: FindingSeverity.REVIEW,
+    PolicyRule.REVIEWER_CONCERN: FindingSeverity.REVIEW,
+}
+
+
+class PatchPolicy(BaseModel):
+    """Restrictions frozen into an AcceptanceSpec before work starts.
+
+    ``rule_severity`` overrides DEFAULT_RULE_SEVERITY per rule. ``allowed_paths``
+    are fnmatch globs; empty means every path is allowed.
+    ``allowed_dependency_changes`` lists package names that may be added,
+    removed, or re-pinned.
+    """
+
+    rule_severity: dict[PolicyRule, FindingSeverity] = Field(default_factory=dict)
+    allowed_paths: list[str] = Field(default_factory=list)
+    allowed_dependency_changes: list[str] = Field(default_factory=list)
+    type_ignore_is_suppression: bool = False
+
+    def severity_for(self, rule: PolicyRule) -> FindingSeverity:
+        return self.rule_severity.get(rule, DEFAULT_RULE_SEVERITY[rule])
+
+
+class PolicyFinding(BaseModel):
+    rule: PolicyRule
+    severity: FindingSeverity
+    path: str
+    line: int | None = None
+    evidence: str = ""
+    source: Literal["deterministic", "reviewer"] = "deterministic"
+
+
+class PatchOutcome(str, Enum):
+    ACCEPTABLE = "ACCEPTABLE"
+    POLICY_VIOLATION = "POLICY_VIOLATION"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    REJECTED_TOO_LARGE = "REJECTED_TOO_LARGE"
+
+
+class ReviewerOpinion(BaseModel):
+    """Advisory LLM review. Never sufficient for acceptance."""
+
+    status: Literal["completed", "unavailable", "skipped"]
+    summary: str = ""
+    concerns: list[str] = Field(default_factory=list)
+    model: str | None = None
+
+
+class TraceConsistency(BaseModel):
+    """Agent-supplied spans checked for internal consistency only."""
+
+    status: Literal["consistent", "inconsistent", "absent"]
+    checks: dict[str, bool] = Field(default_factory=dict)
+    basis: Literal["consistency_only"] = "consistency_only"
+
+
+class VerifyPatchRequest(BaseModel):
+    spec_hash: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    git_diff: str
+    policy: PatchPolicy = Field(default_factory=PatchPolicy)
+    bounty_id: str | None = None
+    solver_agent_id: str | None = None
+    otel_spans: list[dict] | None = None
+    enable_reviewer: bool = True
+
+
+class PatchAssessment(BaseModel):
+    outcome: PatchOutcome
+    findings: list[PolicyFinding] = Field(default_factory=list)
+    reviewer_opinion: ReviewerOpinion
+    trace_consistency: TraceConsistency
+    diff_sha256: str
+    spec_hash: str
+    repo: str
+    pr_number: int
+    head_sha: str
+    issued_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
