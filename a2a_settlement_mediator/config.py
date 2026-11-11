@@ -8,6 +8,7 @@ POST /exchange/resolve.
 from __future__ import annotations
 
 import os
+from urllib.parse import urlparse
 
 
 def _get_int(name: str, default: int) -> int:
@@ -150,3 +151,60 @@ def temperature_kwargs() -> dict[str, float]:
     if settings.llm_temperature is None:
         return {}
     return {"temperature": settings.llm_temperature}
+
+
+class ReceiptsConfigError(RuntimeError):
+    """Public receipts are configured with a TSA this process must not use."""
+
+
+# Hosts of free or publicly shared RFC 3161 authorities. Public proof-of-fix
+# receipts must not be anchored at one of these, including subdomains.
+FREE_TSA_HOSTS = frozenset(
+    {
+        "freetsa.org",
+        "timestamp.sectigo.com",
+        "timestamp.comodoca.com",
+        "timestamp.globalsign.com",
+        "time.certum.pl",
+        "timestamp.entrust.net",
+        "timestamp.apple.com",
+    }
+)
+
+
+def tsa_hostname(tsa_url: str) -> str:
+    """Lowercase host of a TSA URL, or an empty string when it has none."""
+    try:
+        host = urlparse(tsa_url).hostname
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    return host.lower().rstrip(".")
+
+
+def is_free_tsa_url(tsa_url: str) -> bool:
+    """True when ``tsa_url`` points at a host on the free-TSA denylist."""
+    host = tsa_hostname(tsa_url)
+    if not host:
+        return False
+    return any(host == denied or host.endswith("." + denied) for denied in FREE_TSA_HOSTS)
+
+
+def assert_public_receipts_tsa(receipts_public: bool, tsa_url: str) -> None:
+    """Refuse to start when public receipts would be timestamped by a free TSA.
+
+    ``MEDIATOR_RECEIPTS_PUBLIC=false`` is always allowed, including the default
+    freetsa.org URL used by the settlement pipeline. Public receipts require a
+    commercial ``MEDIATOR_TSA_URL``.
+    """
+    if not receipts_public:
+        return
+    if not is_free_tsa_url(tsa_url):
+        return
+    host = tsa_hostname(tsa_url) or tsa_url
+    raise ReceiptsConfigError(
+        "Refusing to start: MEDIATOR_RECEIPTS_PUBLIC=true and MEDIATOR_TSA_URL "
+        f"points at free timestamp authority {host}. Public proof-of-fix receipts "
+        "require a commercial TSA; a free TSA such as freetsa.org is not acceptable."
+    )

@@ -32,6 +32,19 @@ HOUSE_INDEPENDENCE_STATEMENT = (
 )
 
 _NONCE_PATTERN = r"^[0-9a-f]{32}$"
+# Must match settlebridge_verifier.interfaces.InconclusiveReason.
+INCONCLUSIVE_REASONS = frozenset(
+    {
+        "no_positive_control",
+        "deterministic_violation",
+        "controls_failed",
+        "unsupported_project",
+        "budget_exhausted",
+        "infra_error",
+        "failure_class_not_exercised",
+        "tamper_detected",
+    }
+)
 _REPO_PATTERN = r"^[^/\s]+/[^/\s]+$"
 
 
@@ -236,6 +249,11 @@ class ProofOfFixPredicate(BaseModel):
             raise ValueError("verified verdict requires inconclusive_reason to be null")
         if self.verdict is Verdict.INCONCLUSIVE and not (self.inconclusive_reason or "").strip():
             raise ValueError("inconclusive verdict requires inconclusive_reason")
+        if (
+            self.inconclusive_reason is not None
+            and self.inconclusive_reason not in INCONCLUSIVE_REASONS
+        ):
+            raise ValueError("inconclusive_reason is not a known reason")
         expected = _VEX_STATUS_BY_VERDICT[self.verdict]
         if self.vex.status is not expected:
             raise ValueError(

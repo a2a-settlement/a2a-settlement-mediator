@@ -75,7 +75,12 @@ _heartbeat = HeartbeatWorker()
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    from a2a_settlement_mediator.config import assert_public_receipts_tsa
+    from a2a_settlement_mediator.receipts.routes import startup_receipts
+
+    assert_public_receipts_tsa(settings.receipts_public, settings.tsa_url)
     storage.initialize_db()
+    startup_receipts(settings)
     _heartbeat.start()
     yield
     _heartbeat.stop()
@@ -574,3 +579,13 @@ async def verify_patch(
     raw = assessment.model_dump_json()
     storage.save_patch_assessment(_patch_assessment_key(req), raw)
     return json.loads(raw)
+
+
+def _mount_receipt_routes() -> None:
+    """Attach proof-of-fix routes without importing them during app construction."""
+    from a2a_settlement_mediator.receipts.routes import router as receipts_router
+
+    app.include_router(receipts_router)
+
+
+_mount_receipt_routes()

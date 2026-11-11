@@ -1,7 +1,7 @@
 """Proof-of-fix receipt signing: DSSE envelopes, in-toto statements, and SLSA VSAs.
 
-This package builds and signs receipts. It does not store them, serve them,
-or talk to a timestamp authority.
+This package builds and signs receipts. ``service``, ``store``, and ``routes``
+issue, store, serve, and verify them behind ``MEDIATOR_RECEIPTS_ENABLED``.
 """
 
 from a2a_settlement_mediator.receipts.dsse import (
