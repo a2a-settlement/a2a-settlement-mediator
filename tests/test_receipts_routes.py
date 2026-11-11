@@ -298,7 +298,7 @@ def test_inconclusive_vsa_is_failed(api):
     client, _service, _tsa = api
     response = _post(
         client,
-        _body(verdict="inconclusive", inconclusive_reason="coverage gap"),
+        _body(verdict="inconclusive", inconclusive_reason="no_positive_control"),
     )
     assert response.status_code == 201
     vsa = _payload(response.json()["vsa_envelope"])

@@ -99,7 +99,7 @@ def test_statement_subject_and_canonical_json():
 
 
 def test_canonical_json_escapes_non_ascii_like_worm_schemas():
-    statement = _build(verdict=Verdict.INCONCLUSIVE, inconclusive_reason="caf\u00e9")
+    statement = _build(failure_classes_tested=["caf\u00e9"])
     raw = canonical_json_bytes(statement)
     assert "caf\u00e9".encode() not in raw
     assert b"\\u00e9" in raw
@@ -176,7 +176,7 @@ def test_house_document_cannot_claim_independence():
     [
         (Verdict.VERIFIED, "fixed", None),
         (Verdict.INCOMPLETE_FIX_CONFIRMED, "affected", None),
-        (Verdict.INCONCLUSIVE, "under_investigation", "coverage gap"),
+        (Verdict.INCONCLUSIVE, "under_investigation", "no_positive_control"),
     ],
 )
 def test_vex_mapping(verdict, status, reason):
@@ -217,7 +217,7 @@ def test_generated_nonce_is_128_bit_hex(monkeypatch):
     [
         (Verdict.VERIFIED, "PASSED", None),
         (Verdict.INCOMPLETE_FIX_CONFIRMED, "FAILED", None),
-        (Verdict.INCONCLUSIVE, "FAILED", "coverage gap"),
+        (Verdict.INCONCLUSIVE, "FAILED", "no_positive_control"),
     ],
 )
 def test_vsa_result_mapping_and_policy_digest(verdict, result, reason):
@@ -278,3 +278,8 @@ def test_house_independence_rejects_other_platform():
             statement=HOUSE_INDEPENDENCE_STATEMENT,
             lineage_checks_passed=True,
         )
+
+
+def test_unknown_inconclusive_reason_is_rejected():
+    with pytest.raises(ValueError, match="not a known reason"):
+        _build(verdict=Verdict.INCONCLUSIVE, inconclusive_reason="coverage gap")

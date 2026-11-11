@@ -151,7 +151,7 @@ def test_issue_timestamps_both_envelopes_once(service: ReceiptService, tsa: Fake
     [
         (Verdict.VERIFIED, None, "PASSED"),
         (Verdict.INCOMPLETE_FIX_CONFIRMED, None, "FAILED"),
-        (Verdict.INCONCLUSIVE, "coverage gap", "FAILED"),
+        (Verdict.INCONCLUSIVE, "no_positive_control", "FAILED"),
     ],
 )
 def test_vsa_matches_verdict(service, verdict, reason, result):
@@ -348,3 +348,14 @@ def test_free_tsa_host_matching(url, free):
             assert_public_receipts_tsa(True, url)
     else:
         assert_public_receipts_tsa(True, url)
+
+
+def test_issuer_stamps_the_signing_key_id(service: ReceiptService):
+    draft = _draft()
+    draft = draft.model_copy(
+        update={"verifier": draft.verifier.model_copy(update={"key_id": "someone-else"})}
+    )
+    document = service.issue(draft)
+    payload = json.loads(base64.b64decode(document["statement_envelope"]["payload"]))
+    keyid = document["statement_envelope"]["signatures"][0]["keyid"]
+    assert payload["predicate"]["verifier"]["key_id"] == keyid == "kid-test"

@@ -168,7 +168,8 @@ class ReceiptService:
 
     def issue(self, draft: ProofOfFixDraft) -> dict[str, Any]:
         """Sign a draft, timestamp both envelopes once, and append the row."""
-        statement = build_proof_of_fix_statement(draft)
+        verifier = draft.verifier.model_copy(update={"key_id": self._signer.key_id})
+        statement = build_proof_of_fix_statement(draft.model_copy(update={"verifier": verifier}))
         statement_payload = canonical_json_bytes(statement)
         _reject_house_independence_claim(statement, statement_payload)
         vsa = build_vsa(statement)
