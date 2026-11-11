@@ -131,6 +131,16 @@ class MediatorSettings:
     # Maximum UTF-8 size of a git diff accepted by POST /api/v1/verify-patch.
     max_patch_diff_bytes: int = _get_int("MEDIATOR_MAX_PATCH_DIFF_BYTES", 524288)
 
+    # --- Proof-of-fix receipts ---
+    receipts_enabled: bool = _get_bool("MEDIATOR_RECEIPTS_ENABLED", False)
+    # Public receipts refuse to start with a free TSA; set a commercial MEDIATOR_TSA_URL.
+    receipts_public: bool = _get_bool("MEDIATOR_RECEIPTS_PUBLIC", False)
+    # AWS KMS asymmetric key (ECC_NIST_P256, ECDSA_SHA_256). Only the ARN lives here;
+    # the private key never leaves KMS.
+    receipt_kms_key_arn: str = os.getenv("MEDIATOR_RECEIPT_KMS_KEY_ARN", "")
+    receipt_kms_region: str = os.getenv("MEDIATOR_RECEIPT_KMS_REGION", "")
+    receipt_key_id: str = os.getenv("MEDIATOR_RECEIPT_KID", "")
+
 
 settings = MediatorSettings()
 
