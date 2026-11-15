@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from a2a_settlement_mediator.config import resolve_tsa_url
 from a2a_settlement_mediator.worm_schemas import TimestampToken
 
 logger = logging.getLogger(__name__)
@@ -200,14 +201,39 @@ class TSATimeoutError(TSAClientError):
 
 
 class RFC3161Client:
-    """HTTP client for requesting RFC 3161 timestamps from a TSA."""
+    """HTTP client for requesting RFC 3161 timestamps from a TSA.
+
+    Optional keyword arguments add a fallback URL, a bearer token, and mTLS
+    material. Omitting them preserves the previous URL-and-timeout behavior.
+    The bearer token is never written to logs or exception text.
+    """
 
     CONTENT_TYPE_REQUEST = "application/timestamp-query"
     CONTENT_TYPE_RESPONSE = "application/timestamp-reply"
 
-    def __init__(self, tsa_url: str, timeout_seconds: float = 10.0) -> None:
-        self.tsa_url = tsa_url
+    def __init__(
+        self,
+        tsa_url: str,
+        timeout_seconds: float = 10.0,
+        *,
+        fallback_url: str = "",
+        bearer_token: str = "",
+        client_cert: str = "",
+        client_key: str = "",
+        ca_bundle: str = "",
+    ) -> None:
+        self.tsa_url = resolve_tsa_url(tsa_url)
         self.timeout_seconds = timeout_seconds
+        self.fallback_url = resolve_tsa_url(fallback_url) if fallback_url.strip() else ""
+        self.bearer_token = bearer_token.strip()
+        self.client_cert = client_cert.strip()
+        self.client_key = client_key.strip()
+        self.ca_bundle = ca_bundle.strip()
+        if self.client_key and not self.client_cert:
+            raise ValueError(
+                "TSA client key requires a client certificate "
+                "(MEDIATOR_TSA_CLIENT_CERT / client_cert)"
+            )
 
     def request_timestamp(self, payload_hash: bytes) -> TimestampToken:
         """Request an RFC 3161 timestamp for a SHA-256 hash.
@@ -216,7 +242,8 @@ class RFC3161Client:
             payload_hash: 32-byte SHA-256 digest to be timestamped.
 
         Returns:
-            TimestampToken with the TSA's signed response.
+            TimestampToken with the TSA's signed response. ``tsa_url`` is the
+            authority that actually issued the token (primary or fallback).
 
         Raises:
             TSATimeoutError: If the TSA does not respond in time.
@@ -225,51 +252,74 @@ class RFC3161Client:
         if len(payload_hash) != 32:
             raise ValueError(f"Expected 32-byte SHA-256 hash, got {len(payload_hash)} bytes")
 
+        try:
+            return self._request_from(self.tsa_url, payload_hash)
+        except TSAClientError as exc:
+            if not self.fallback_url:
+                raise
+            logger.warning(
+                "Primary TSA %s failed (%s); retrying fallback TSA %s",
+                self.tsa_url,
+                self._scrub(str(exc)),
+                self.fallback_url,
+            )
+            return self._request_from(self.fallback_url, payload_hash)
+
+    def _request_from(self, tsa_url: str, payload_hash: bytes) -> TimestampToken:
         nonce = int.from_bytes(os.urandom(16), "big")
         request_der = build_timestamp_request(payload_hash, nonce=nonce)
 
-        logger.info("Requesting RFC 3161 timestamp from %s", self.tsa_url)
+        logger.info("Requesting RFC 3161 timestamp from %s", tsa_url)
         t0 = time.monotonic()
 
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            with self._open_client(self.timeout_seconds) as client:
                 resp = client.post(
-                    self.tsa_url,
+                    tsa_url,
                     content=request_der,
-                    headers={"Content-Type": self.CONTENT_TYPE_REQUEST},
+                    headers=self._request_headers(),
                 )
         except httpx.TimeoutException as exc:
             elapsed = int((time.monotonic() - t0) * 1000)
-            logger.error("TSA timeout after %dms: %s", elapsed, exc)
+            logger.error(
+                "TSA timeout after %dms: %s", elapsed, self._scrub(str(exc))
+            )
             raise TSATimeoutError(
-                f"TSA server at {self.tsa_url} timed out after {self.timeout_seconds}s"
+                f"TSA server at {tsa_url} timed out after {self.timeout_seconds}s"
             ) from exc
         except httpx.HTTPError as exc:
-            raise TSAClientError(f"TSA HTTP error: {exc}") from exc
+            raise TSAClientError(
+                self._scrub(f"TSA HTTP error talking to {tsa_url}: {exc}")
+            ) from exc
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         if resp.status_code != 200:
+            body = self._scrub(resp.text[:500])
             raise TSAClientError(
-                f"TSA returned HTTP {resp.status_code}: {resp.text[:500]}"
+                f"TSA at {tsa_url} returned HTTP {resp.status_code}: {body}"
             )
 
         response_der = resp.content
         if not response_der:
-            raise TSAClientError("TSA returned empty response body")
+            raise TSAClientError(f"TSA at {tsa_url} returned an empty response body")
 
         try:
             status = parse_timestamp_response_status(response_der)
         except (ValueError, IndexError) as exc:
-            raise TSAClientError(f"Failed to parse TSA response: {exc}") from exc
+            raise TSAClientError(
+                f"Failed to parse TSA response from {tsa_url}: {exc}"
+            ) from exc
 
         if status not in (0, 1):  # granted or grantedWithMods
-            raise TSAClientError(f"TSA rejected timestamp request with status={status}")
+            raise TSAClientError(
+                f"TSA at {tsa_url} rejected timestamp request with status={status}"
+            )
 
         logger.info("RFC 3161 timestamp granted in %dms (status=%d)", elapsed_ms, status)
 
         return TimestampToken(
-            tsa_url=self.tsa_url,
+            tsa_url=tsa_url,
             hash_algorithm="sha256",
             message_hash=payload_hash.hex(),
             timestamp_token_b64=base64.b64encode(response_der).decode("ascii"),
@@ -280,8 +330,42 @@ class RFC3161Client:
     def health_check(self) -> bool:
         """Quick check that the TSA URL is reachable."""
         try:
-            with httpx.Client(timeout=5.0) as client:
-                resp = client.head(self.tsa_url)
+            with self._open_client(5.0) as client:
+                resp = client.head(self.tsa_url, headers=self._authorization_headers())
                 return resp.status_code < 500
         except httpx.HTTPError:
             return False
+
+    def _open_client(self, timeout: float) -> httpx.Client:
+        kwargs: dict[str, object] = {
+            "timeout": timeout,
+            "verify": self.ca_bundle if self.ca_bundle else True,
+        }
+        cert = self._client_cert()
+        if cert is not None:
+            kwargs["cert"] = cert
+        return httpx.Client(**kwargs)
+
+    def _client_cert(self) -> str | tuple[str, str] | None:
+        if self.client_cert and self.client_key:
+            return (self.client_cert, self.client_key)
+        if self.client_cert:
+            return self.client_cert
+        return None
+
+    def _authorization_headers(self) -> dict[str, str]:
+        if not self.bearer_token:
+            return {}
+        return {"Authorization": f"Bearer {self.bearer_token}"}
+
+    def _request_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": self.CONTENT_TYPE_REQUEST}
+        headers.update(self._authorization_headers())
+        return headers
+
+    def _scrub(self, text: str) -> str:
+        """Remove the bearer token from text that might be logged or raised."""
+        token = self.bearer_token
+        if token and token in text:
+            return text.replace(token, "[redacted]")
+        return text

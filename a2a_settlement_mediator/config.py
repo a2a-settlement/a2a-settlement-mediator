@@ -42,6 +42,33 @@ def _get_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+# Commercial RFC 3161 presets. Lookup is case-insensitive.
+# ``timestamp.sectigo.com`` is also on FREE_TSA_HOSTS, so public receipts still
+# refuse the sectigo preset. digicert is a commercial URL they can use.
+COMMERCIAL_TSA_PRESETS = {
+    "digicert": "http://timestamp.digicert.com",
+    "sectigo": "http://timestamp.sectigo.com",
+}
+
+
+def resolve_tsa_url(raw: str) -> str:
+    """Map a commercial preset name to its URL, otherwise return ``raw`` stripped.
+
+    ``MEDIATOR_TSA_URL=digicert`` and a full ``http(s)`` URL both resolve.
+    Unknown names are returned unchanged so enterprise URLs pass through.
+    """
+    text = raw.strip()
+    return COMMERCIAL_TSA_PRESETS.get(text.lower(), text)
+
+
+def _optional_tsa_url(name: str) -> str:
+    """Resolve an optional TSA URL env var. Blank stays blank."""
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return ""
+    return resolve_tsa_url(raw)
+
+
 class MediatorSettings:
     # --- Exchange connection ---
     exchange_url: str = os.getenv("A2A_EXCHANGE_URL", "http://127.0.0.1:3000/v1")
@@ -87,10 +114,20 @@ class MediatorSettings:
     escalation_webhook_url: str = os.getenv("MEDIATOR_ESCALATION_WEBHOOK_URL", "")
 
     # --- SEC 17a-4 WORM Settlement Pipeline ---
-    # RFC 3161 Time Stamp Authority URL (e.g., http://freetsa.org/tsr)
-    tsa_url: str = os.getenv("MEDIATOR_TSA_URL", "http://freetsa.org/tsr")
+    # RFC 3161 Time Stamp Authority URL, or a commercial preset (digicert, sectigo).
+    tsa_url: str = resolve_tsa_url(
+        os.getenv("MEDIATOR_TSA_URL", "http://freetsa.org/tsr")
+    )
     # Maximum seconds to wait for TSA response before hard-failing the settlement.
     tsa_timeout_seconds: float = _get_float("MEDIATOR_TSA_TIMEOUT", 15.0)
+    # Tried only after the primary TSA raises a transport, HTTP, or TSA error.
+    tsa_fallback_url: str = _optional_tsa_url("MEDIATOR_TSA_FALLBACK_URL")
+    # Enterprise TSA authentication. Never log this value.
+    tsa_bearer_token: str = os.getenv("MEDIATOR_TSA_BEARER_TOKEN", "")
+    # Optional mTLS. Both paths, or a single PEM in the cert setting.
+    tsa_client_cert: str = os.getenv("MEDIATOR_TSA_CLIENT_CERT", "")
+    tsa_client_key: str = os.getenv("MEDIATOR_TSA_CLIENT_KEY", "")
+    tsa_ca_bundle: str = os.getenv("MEDIATOR_TSA_CA_BUNDLE", "")
 
     # --- Heartbeat recovery worker ---
     heartbeat_interval_seconds: float = _get_float("MEDIATOR_HEARTBEAT_INTERVAL", 30.0)
@@ -191,18 +228,42 @@ def is_free_tsa_url(tsa_url: str) -> bool:
     return any(host == denied or host.endswith("." + denied) for denied in FREE_TSA_HOSTS)
 
 
-def assert_public_receipts_tsa(receipts_public: bool, tsa_url: str) -> None:
+def assert_public_receipts_tsa(
+    receipts_public: bool,
+    tsa_url: str,
+    fallback_tsa_url: str = "",
+) -> None:
     """Refuse to start when public receipts would be timestamped by a free TSA.
 
     ``MEDIATOR_RECEIPTS_PUBLIC=false`` is always allowed, including the default
     freetsa.org URL used by the settlement pipeline. Public receipts require a
-    commercial ``MEDIATOR_TSA_URL``.
+    commercial ``MEDIATOR_TSA_URL``. When ``fallback_tsa_url`` is set, it is held
+    to the same rule so a free TSA cannot silently anchor public receipts.
+    Preset names are resolved before the host check. The two-argument form is
+    unchanged: omitting the fallback does not consult process settings.
     """
     if not receipts_public:
         return
-    if not is_free_tsa_url(tsa_url):
+    _reject_free_public_tsa(tsa_url, setting="MEDIATOR_TSA_URL")
+    if fallback_tsa_url.strip():
+        _reject_free_public_tsa(
+            fallback_tsa_url, setting="MEDIATOR_TSA_FALLBACK_URL"
+        )
+
+
+def _reject_free_public_tsa(raw_url: str, *, setting: str) -> None:
+    resolved = resolve_tsa_url(raw_url)
+    if not is_free_tsa_url(resolved):
         return
-    host = tsa_hostname(tsa_url) or tsa_url
+    host = tsa_hostname(resolved) or resolved
+    if setting == "MEDIATOR_TSA_FALLBACK_URL":
+        raise ReceiptsConfigError(
+            "Refusing to start: MEDIATOR_RECEIPTS_PUBLIC=true and "
+            "MEDIATOR_TSA_FALLBACK_URL "
+            f"points at free timestamp authority {host}. Public proof-of-fix "
+            "receipts require a commercial TSA; a fallback to a free TSA such as "
+            "freetsa.org is not acceptable."
+        )
     raise ReceiptsConfigError(
         "Refusing to start: MEDIATOR_RECEIPTS_PUBLIC=true and MEDIATOR_TSA_URL "
         f"points at free timestamp authority {host}. Public proof-of-fix receipts "
