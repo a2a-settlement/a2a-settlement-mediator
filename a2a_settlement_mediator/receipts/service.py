@@ -162,7 +162,15 @@ class ReceiptService:
         """KMS signer when configured, otherwise the local signer policy."""
         return cls(
             signer=signer_from_settings(current),
-            tsa=RFC3161Client(current.tsa_url, current.tsa_timeout_seconds),
+            tsa=RFC3161Client(
+                current.tsa_url,
+                current.tsa_timeout_seconds,
+                fallback_url=getattr(current, "tsa_fallback_url", ""),
+                bearer_token=getattr(current, "tsa_bearer_token", ""),
+                client_cert=getattr(current, "tsa_client_cert", ""),
+                client_key=getattr(current, "tsa_client_key", ""),
+                ca_bundle=getattr(current, "tsa_ca_bundle", ""),
+            ),
             store=ReceiptStore(),
         )
 

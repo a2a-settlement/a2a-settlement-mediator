@@ -78,7 +78,11 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     from a2a_settlement_mediator.config import assert_public_receipts_tsa
     from a2a_settlement_mediator.receipts.routes import startup_receipts
 
-    assert_public_receipts_tsa(settings.receipts_public, settings.tsa_url)
+    assert_public_receipts_tsa(
+        settings.receipts_public,
+        settings.tsa_url,
+        getattr(settings, "tsa_fallback_url", ""),
+    )
     storage.initialize_db()
     startup_receipts(settings)
     _heartbeat.start()
