@@ -23,6 +23,9 @@ from a2a_settlement_mediator.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# The values the exchange stores in an escrow's ``self_dealing_class`` column.
+_SELF_DEALING_CLASSES = frozenset({"arms_length", "suspected_self_dealing", "self_dealing"})
+
 
 def _get_sdk_client() -> SettlementExchangeClient:
     base = settings.exchange_url.rstrip("/")
@@ -63,6 +66,30 @@ def _check_attestation_freshness(client: SettlementExchangeClient, account_id: s
     except Exception:
         logger.warning("Attestation freshness check failed for %s", account_id)
         return None
+
+
+def _self_dealing_class(escrow_data: dict) -> str | None:
+    """Return the exchange's self-dealing classification for an escrow.
+
+    The exchange classifies each escrow when it is created and stores the
+    result on the escrow row. Only the top-level ``self_dealing_class`` key of
+    the escrow record is read: nothing a requester or provider can write
+    (dispute reason, deliverables, provenance, submitted evidence) is
+    consulted. A missing key, ``None`` or any value other than the three the
+    exchange defines is treated as unclassified, so the dispute takes the same
+    path as one with no classification.
+    """
+    value = escrow_data.get("self_dealing_class")
+    if value is None:
+        return None
+    if isinstance(value, str) and value in _SELF_DEALING_CLASSES:
+        return value
+    logger.warning(
+        "Escrow %s has unrecognised self_dealing_class %r; treating as unclassified",
+        escrow_data.get("id"),
+        value,
+    )
+    return None
 
 
 def collect_evidence(escrow_id: str) -> EvidenceBundle:
@@ -107,6 +134,7 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
         delivered_at=escrow_data.get("delivered_at"),
         created_at=escrow_data.get("created_at"),
         expires_at=escrow_data.get("expires_at"),
+        self_dealing_class=_self_dealing_class(escrow_data),
     )
 
     requester = _fetch_account_evidence(client, escrow_data["requester_id"])
