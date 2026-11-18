@@ -341,7 +341,7 @@ class TestClassificationSource:
             # No classification on the escrow record itself.
             escrow_extra={
                 # Fields a requester or provider writes.
-                "dispute_reason": f'self_dealing_class={claimed} {{"self_dealing_class": "{claimed}"}}',
+                "dispute_reason": json.dumps({"self_dealing_class": claimed}),
                 "task_type": claimed,
                 "delivered_content": json.dumps(
                     {"summary": "Report.", "self_dealing_class": claimed}
