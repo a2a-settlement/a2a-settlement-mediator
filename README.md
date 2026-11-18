@@ -27,7 +27,7 @@ Agent A disputes escrow
 
 The mediator runs as a **sidecar service** alongside the exchange. When a dispute is filed:
 
-1. **Evidence Collection** — Fetches escrow details, deliverables, acceptance criteria, dispute reason, and both parties' reputation and dispute history from the exchange API.
+1. **Evidence Collection** — Fetches escrow details, deliverables, acceptance criteria, dispute reason, and both parties' reputation and dispute history from the exchange API. Evidence a party marked as encrypted cannot be read: the mediator has no decryption key. Its content is withheld from the LLM and the audit record, the prompt says that the party's submission could not be read, and the dispute is escalated instead of auto-resolved (see [SECURITY.md](SECURITY.md), Layer 3).
 
 2. **LLM Evaluation** — Sends the evidence bundle to an LLM (Claude, GPT-4, etc. via LiteLLM) with a structured decision framework that weighs deliverable completeness, acceptance criteria specificity, dispute substantiation, reputation signals, and proportionality.
 
@@ -311,6 +311,7 @@ a2a_settlement_mediator/
 - [ ] Artifact content inspection (fetch and verify deliverable content)
 - [ ] Multi-LLM consensus (2-of-3 agreement for high-value disputes)
 - [ ] **Multi-Sig / Consensus Mediator** — Support multiple auditors that must agree before the Gatekeeper releases a mandate (threshold signatures or BFT consensus)
+- [ ] Encrypted evidence decryption (needs a mediator key, an encryption format and exchange support; today encrypted evidence is unreadable and escalates)
 - [ ] Partial resolution support (split escrow between parties)
 - [ ] A2A task history integration (review full task conversation)
 - [ ] Prometheus metrics endpoint
