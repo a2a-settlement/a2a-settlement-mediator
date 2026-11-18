@@ -4,8 +4,10 @@ Receives escrow.disputed events and triggers the mediation pipeline.
 Verifies webhook signatures using HMAC-SHA256 (same scheme as the exchange).
 
 Every route except ``/health``, ``/guide``, ``/schemas`` and the public
-receipt lookups requires an HMAC keyed with ``MEDIATOR_WEBHOOK_SECRET``.
-Three message formats share that key:
+receipt lookups requires an HMAC. Each purpose (exchange webhook, operator
+routes, verify-patch, receipts) is keyed with its own secret when one is set
+and with ``MEDIATOR_WEBHOOK_SECRET`` otherwise; see ``_accepted_secrets``.
+There are three message formats:
 
 * ``/webhook``: ``sha256=`` HMAC over the raw body (the exchange's scheme).
 * ``/api/v1/verify-patch`` and ``POST /api/v1/receipts``: ``sha256=`` HMAC
@@ -124,50 +126,181 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mediator")
 
 
 UNAUTHENTICATED_OPT_OUT_ENV = "MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED"
+TRANSITION_ENV = "MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK"
+WEBHOOK_SECRET_ENV = "MEDIATOR_WEBHOOK_SECRET"
+
+PURPOSE_WEBHOOK = "webhook"
+PURPOSE_OPERATOR = "operator"
+PURPOSE_VERIFY_PATCH = "verify-patch"
+PURPOSE_RECEIPTS = "receipts"
+
+# purpose -> (settings attribute, environment variable, what it protects)
+_PURPOSES: dict[str, tuple[str, str, str]] = {
+    PURPOSE_WEBHOOK: ("webhook_secret", WEBHOOK_SECRET_ENV, "/webhook"),
+    PURPOSE_OPERATOR: ("operator_secret", "MEDIATOR_OPERATOR_SECRET", "the operator routes"),
+    PURPOSE_VERIFY_PATCH: (
+        "verify_patch_secret",
+        "MEDIATOR_VERIFY_PATCH_SECRET",
+        "/api/v1/verify-patch",
+    ),
+    PURPOSE_RECEIPTS: ("receipts_secret", "MEDIATOR_RECEIPTS_SECRET", "POST /api/v1/receipts"),
+}
+# The development opt-out has only ever covered these two.
+_OPT_OUT_PURPOSES = (PURPOSE_WEBHOOK, PURPOSE_OPERATOR)
 
 
-def _unauthenticated_allowed() -> bool:
-    """True only when no secret is configured and the development opt-out is on.
+def _own_secret(purpose: str) -> str:
+    return getattr(settings, _PURPOSES[purpose][0], "") or ""
+
+
+def _accepted_secrets(purpose: str) -> tuple[str, ...]:
+    """The secrets a signature for ``purpose`` may be keyed with. Never an empty key.
+
+    * The purpose has no secret of its own: ``MEDIATOR_WEBHOOK_SECRET`` only.
+    * It has one: that secret only. ``MEDIATOR_WEBHOOK_SECRET`` is refused, which
+      is the point of the split.
+    * It has one and ``MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK`` is on: both,
+      so a caller can be moved to the new secret without a failed request.
+
+    An empty result means the purpose is unconfigured and must fail closed.
+    """
+    shared = settings.webhook_secret
+    own = _own_secret(purpose)
+    if purpose == PURPOSE_WEBHOOK or not own:
+        return (shared,) if shared else ()
+    if settings.secret_transition_accept_fallback and shared and shared != own:
+        return (own, shared)
+    return (own,)
+
+
+def _matching_hmac(purpose: str, message: bytes, presented: bytes, prefix: str) -> str | None:
+    """Hex HMAC-SHA256 of ``message`` under the accepted secret that ``presented`` matches.
+
+    ``presented`` is the whole header value and ``prefix`` its scheme, such as
+    ``sha256=``. Every accepted secret is tried, so timing does not show which
+    one matched. Returns None when none does.
+    """
+    matched: str | None = None
+    for secret in _accepted_secrets(purpose):
+        digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(f"{prefix}{digest}".encode("ascii"), presented):
+            matched = digest
+    return matched
+
+
+def _unauthenticated_allowed(purpose: str = PURPOSE_WEBHOOK) -> bool:
+    """True only when ``purpose`` has no secret and the development opt-out is on.
 
     A configured secret always wins: the opt-out cannot switch verification off
-    on a deployment that has one.
+    for a purpose that has one, whether its own or the webhook secret.
     """
-    return not settings.webhook_secret and settings.allow_unauthenticated
+    return not _accepted_secrets(purpose) and settings.allow_unauthenticated
+
+
+def _same(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def _secret_source(purpose: str) -> str:
+    """Where a purpose's secret comes from, by setting name. Never a value."""
+    _attr, env, _what = _PURPOSES[purpose]
+    shared = settings.webhook_secret
+    own = _own_secret(purpose)
+    if purpose == PURPOSE_WEBHOOK:
+        return env if shared else "not set"
+    if not own:
+        return f"shares {WEBHOOK_SECRET_ENV}" if shared else "not set"
+    if shared and _same(own, shared):
+        return f"{env} (same value as {WEBHOOK_SECRET_ENV})"
+    for other in _PURPOSES:
+        if other == purpose:
+            break
+        if other != PURPOSE_WEBHOOK and _same(own, _own_secret(other)):
+            return f"{env} (same value as {_PURPOSES[other][1]})"
+    if settings.secret_transition_accept_fallback and shared:
+        return f"{env} (transition: {WEBHOOK_SECRET_ENV} also accepted)"
+    return f"{env} (own secret)"
 
 
 def _log_auth_posture() -> None:
-    """Say at startup how /webhook and the operator routes are protected."""
-    if settings.webhook_secret:
-        if settings.allow_unauthenticated:
+    """Say at startup which secret protects each purpose. Names only, never values."""
+    logger.info(
+        "Request signing secrets: %s",
+        "; ".join(f"{purpose}: {_secret_source(purpose)}" for purpose in _PURPOSES),
+    )
+
+    shared = settings.webhook_secret
+    if shared and all(
+        not _own_secret(purpose) or _same(_own_secret(purpose), shared)
+        for purpose in _PURPOSES
+        if purpose != PURPOSE_WEBHOOK
+    ):
+        logger.warning(
+            "One secret (%s) signs the exchange webhook, the operator routes, "
+            "verify-patch and receipts: whoever holds it can call all of them. Set "
+            "MEDIATOR_OPERATOR_SECRET, MEDIATOR_VERIFY_PATCH_SECRET and "
+            "MEDIATOR_RECEIPTS_SECRET to different values to separate them",
+            WEBHOOK_SECRET_ENV,
+        )
+
+    if settings.secret_transition_accept_fallback:
+        both = [
+            _PURPOSES[purpose][1] for purpose in _PURPOSES if len(_accepted_secrets(purpose)) > 1
+        ]
+        if both:
             logger.warning(
-                "%s is set but ignored because MEDIATOR_WEBHOOK_SECRET is configured; "
-                "signatures are still required",
+                "%s is on: %s also accepted for the purposes that have their own "
+                "secret (%s). Turn it off once every caller signs with its own secret",
+                TRANSITION_ENV,
+                WEBHOOK_SECRET_ENV,
+                ", ".join(both),
+            )
+        else:
+            logger.warning(
+                "%s is on but has no effect: no purpose has both its own secret "
+                "and a different %s",
+                TRANSITION_ENV,
+                WEBHOOK_SECRET_ENV,
+            )
+
+    unset = [purpose for purpose in _PURPOSES if not _accepted_secrets(purpose)]
+    open_ = [purpose for purpose in unset if purpose in _OPT_OUT_PURPOSES]
+    if settings.allow_unauthenticated:
+        if not open_:
+            logger.warning(
+                "%s is set but ignored because a secret is configured for /webhook "
+                "and the operator routes; signatures are still required",
                 UNAUTHENTICATED_OPT_OUT_ENV,
             )
-        return
-    if settings.allow_unauthenticated:
+        else:
+            logger.warning(
+                "INSECURE: %s is on and no secret is set for %s. "
+                "(Operator routes: /mediate, /audits, /settle, /settlements, /merkle, "
+                "/heartbeat/status.) These accept UNAUTHENTICATED requests. Anyone "
+                "who can reach this port can call them; the operator routes trigger "
+                "mediation with the operator API key. "
+                "Never run a reachable deployment this way.",
+                UNAUTHENTICATED_OPT_OUT_ENV,
+                " or ".join(_PURPOSES[purpose][2] for purpose in open_),
+            )
+        unset = [purpose for purpose in unset if purpose not in open_]
+    if unset:
         logger.warning(
-            "INSECURE: %s is on and MEDIATOR_WEBHOOK_SECRET is empty. /webhook and "
-            "the operator routes (/mediate, /audits, /settle, /settlements, /merkle, "
-            "/heartbeat/status) accept UNAUTHENTICATED requests. Anyone who can "
-            "reach this port can trigger mediation with the operator API key. "
-            "Never run a reachable deployment this way.",
-            UNAUTHENTICATED_OPT_OUT_ENV,
+            "No secret is set for %s: every request to them is refused with 503 "
+            "until %s or the purpose's own secret is set",
+            ", ".join(_PURPOSES[purpose][2] for purpose in unset),
+            WEBHOOK_SECRET_ENV,
         )
-        return
-    logger.warning(
-        "MEDIATOR_WEBHOOK_SECRET is empty: /webhook and the operator routes refuse "
-        "every request with 503 until it is set"
-    )
 
 
 def _verify_signature(body: bytes, signature: str | None) -> bool:
     """Verify the webhook HMAC-SHA256 signature.
 
-    With no secret this returns False unless the development opt-out is on.
+    Keyed with ``MEDIATOR_WEBHOOK_SECRET`` only. With no secret this returns
+    False unless the development opt-out is on.
     """
-    if not settings.webhook_secret:
-        if _unauthenticated_allowed():
+    if not _accepted_secrets(PURPOSE_WEBHOOK):
+        if _unauthenticated_allowed(PURPOSE_WEBHOOK):
             logger.warning(
                 "Webhook signature verification skipped (%s is on)",
                 UNAUTHENTICATED_OPT_OUT_ENV,
@@ -178,14 +311,8 @@ def _verify_signature(body: bytes, signature: str | None) -> bool:
     if not signature:
         return False
 
-    expected = hmac.new(
-        settings.webhook_secret.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-
-    expected_sig = f"sha256={expected}"
-    return hmac.compare_digest(expected_sig, signature)
+    matched = _matching_hmac(PURPOSE_WEBHOOK, body, signature.encode("utf-8"), "sha256=")
+    return matched is not None
 
 
 def _now() -> float:
@@ -193,22 +320,22 @@ def _now() -> float:
 
 
 def _verify_patch_signature(
-    body: bytes, timestamp: str, signature: str | None
+    body: bytes,
+    timestamp: str,
+    signature: str | None,
+    purpose: str = PURPOSE_VERIFY_PATCH,
 ) -> str | None:
     """Return the verified signature hex, or None.
 
     The signed message is the timestamp header, a literal ``.``, then the raw
-    body. Fail closed when unconfigured: ``_verify_signature`` succeeds when
-    no webhook secret is set, and payment checks must refuse that path.
+    body. ``purpose`` selects the secret: verify-patch or receipts. Fail closed
+    when unconfigured: ``_verify_signature`` can succeed with no secret set,
+    and payment checks must refuse that path.
     """
-    secret = settings.webhook_secret
-    if not secret or not signature:
+    if not signature:
         return None
     message = f"{timestamp}.".encode("ascii") + body
-    expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(f"sha256={expected}", signature):
-        return None
-    return expected
+    return _matching_hmac(purpose, message, signature.encode("utf-8"), "sha256=")
 
 
 # ---------------------------------------------------------------------------
@@ -256,9 +383,8 @@ async def require_operator_signature(request: Request) -> None:
     configured, 401 for a missing, malformed, stale or wrong signature, and
     409 when a verified signature is presented a second time.
     """
-    secret = settings.webhook_secret
-    if not secret:
-        if _unauthenticated_allowed():
+    if not _accepted_secrets(PURPOSE_OPERATOR):
+        if _unauthenticated_allowed(PURPOSE_OPERATOR):
             return
         raise HTTPException(
             status_code=503,
@@ -292,10 +418,13 @@ async def require_operator_signature(request: Request) -> None:
     message = operator_signature_message(
         timestamp, nonce, request.method, _request_target(request), body
     )
-    expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
-    presented = signature.encode("utf-8")
-    wanted = f"{OPERATOR_SIGNATURE_VERSION}={expected}".encode("ascii")
-    if not hmac.compare_digest(wanted, presented):
+    expected = _matching_hmac(
+        PURPOSE_OPERATOR,
+        message,
+        signature.encode("utf-8"),
+        f"{OPERATOR_SIGNATURE_VERSION}=",
+    )
+    if expected is None:
         raise HTTPException(status_code=401, detail="Invalid operator signature")
 
     # Same single-use store as verify-patch. The two forms cannot collide: they
@@ -441,7 +570,7 @@ async def receive_webhook(
     Only processes 'escrow.disputed' events. All others are acknowledged
     but ignored.
     """
-    if not settings.webhook_secret and not _unauthenticated_allowed():
+    if not _accepted_secrets(PURPOSE_WEBHOOK) and not _unauthenticated_allowed(PURPOSE_WEBHOOK):
         logger.warning("webhook refused because MEDIATOR_WEBHOOK_SECRET is empty")
         raise HTTPException(
             status_code=503,
@@ -716,11 +845,15 @@ async def verify_patch(
 
     Requires ``X-A2ASE-Timestamp`` (unix seconds) and
     ``X-A2ASE-Signature: sha256=<hex>`` over ``{timestamp}.{raw body}``.
-    An empty webhook secret refuses the request. A verified signature is
-    accepted only once inside its timestamp window.
+    Keyed with ``MEDIATOR_VERIFY_PATCH_SECRET`` when set, otherwise
+    ``MEDIATOR_WEBHOOK_SECRET``. With neither set the request is refused. A
+    verified signature is accepted only once inside its timestamp window.
     """
-    if not settings.webhook_secret:
-        logger.warning("verify-patch refused because MEDIATOR_WEBHOOK_SECRET is empty")
+    if not _accepted_secrets(PURPOSE_VERIFY_PATCH):
+        logger.warning(
+            "verify-patch refused because neither MEDIATOR_VERIFY_PATCH_SECRET nor "
+            "MEDIATOR_WEBHOOK_SECRET is set"
+        )
         raise HTTPException(
             status_code=503,
             detail="verify-patch requires MEDIATOR_WEBHOOK_SECRET",

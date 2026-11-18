@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from a2a_settlement_mediator import storage, webhook_listener
 from a2a_settlement_mediator.config import settings
+from a2a_settlement_mediator.receipts import routes as receipt_routes
 from a2a_settlement_mediator.webhook_listener import app, operator_signature_message
 
 _SECRET = "test-secret"
@@ -62,12 +63,23 @@ _PUBLIC = {
     ("POST", "/api/v1/receipts/verify"),
     ("GET", "/.well-known/settlebridge-receipt-keys.json"),
 }
-# Routes that verify their own HMAC inside the handler.
+# Routes that verify their own HMAC inside the handler, and the purpose whose
+# secret keys it. Every other authenticated route is an operator route.
 _OWN_HMAC = {
-    ("POST", "/webhook"),
-    ("POST", "/api/v1/verify-patch"),
-    ("POST", "/api/v1/receipts"),
+    ("POST", "/webhook"): "webhook",
+    ("POST", "/api/v1/verify-patch"): "verify-patch",
+    ("POST", "/api/v1/receipts"): "receipts",
 }
+
+# One distinct secret per purpose, for the tests that separate them.
+_PURPOSE_ATTR = {
+    "webhook": "webhook_secret",
+    "operator": "operator_secret",
+    "verify-patch": "verify_patch_secret",
+    "receipts": "receipts_secret",
+}
+_SPLIT = {purpose: f"{purpose}-only-secret" for purpose in _PURPOSE_ATTR}
+_SPLIT_PURPOSES = ["operator", "verify-patch", "receipts"]
 
 
 @pytest.fixture
@@ -99,11 +111,18 @@ def client(tmp_path, monkeypatch, handlers):
     # Audit rows are unique per escrow and second; the routes under test would
     # otherwise collide with the row above.
     monkeypatch.setattr(storage, "save_audit_record", MagicMock())
-    monkeypatch.setattr(settings, "webhook_secret", _SECRET)
+    _configure(monkeypatch, webhook=_SECRET)
     monkeypatch.setattr(settings, "allow_unauthenticated", False)
     monkeypatch.setattr(settings, "signature_tolerance_seconds", 300)
     monkeypatch.setattr(webhook_listener, "_now", lambda: float(_NOW))
     return TestClient(app)
+
+
+def _configure(monkeypatch, *, transition: bool = False, **secrets: str) -> None:
+    """Set the four secrets by purpose name; a purpose left out is unset."""
+    for purpose, attr in _PURPOSE_ATTR.items():
+        monkeypatch.setattr(settings, attr, secrets.get(purpose.replace("-", "_"), ""))
+    monkeypatch.setattr(settings, "secret_transition_accept_fallback", transition)
 
 
 def _sign(
@@ -133,6 +152,36 @@ def _send(client: TestClient, method: str, target: str, body: bytes | None, head
     # Bytes, so a test can put non-ASCII octets in a header value.
     raw = [(k.encode("ascii"), v.encode("utf-8")) for k, v in headers.items()]
     return client.request(method, target, content=body, headers=raw)
+
+
+_calls = iter(range(10**6))
+
+
+def _call_as(client: TestClient, key: tuple[str, str], purpose: str, secret: str | None):
+    """Send a request to ``key`` signed with ``secret`` in its purpose's scheme.
+
+    ``secret=None`` sends it unsigned. The body is not a valid payload for the
+    self-verifying routes, so "authenticated" shows as any status other than
+    401 or 503. Each call differs, so none is refused as a replay.
+    """
+    method, path = key
+    target = path.replace("{escrow_id}", "esc-1")
+    unique = next(_calls)
+    if purpose == "operator":
+        headers = None
+        if secret is not None:
+            headers = _sign(method, target, None, secret=secret, nonce=f"nonce-{unique:016d}")
+        return _send(client, method, target, None, headers)
+    body = json.dumps({"event": "escrow.released", "n": unique}).encode()
+    headers = {}
+    if secret is not None and purpose == "webhook":
+        headers["X-A2ASE-Signature"] = _webhook_sig(body, secret)
+    elif secret is not None:
+        message = f"{_TIMESTAMP}.".encode() + body
+        digest = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+        headers["X-A2ASE-Timestamp"] = _TIMESTAMP
+        headers["X-A2ASE-Signature"] = f"sha256={digest}"
+    return _send(client, method, target, body, headers)
 
 
 def _assert_untouched(handlers) -> None:
@@ -195,7 +244,7 @@ def test_every_route_is_public_self_verifying_or_operator_authenticated(client, 
     for path, operations in app.openapi()["paths"].items():
         for method in operations:
             key = (method.upper(), path)
-            if key in _PUBLIC | _OWN_HMAC:
+            if key in _PUBLIC or key in _OWN_HMAC:
                 continue
             resp = client.request(key[0], path.replace("{escrow_id}", "esc-1"))
             assert resp.status_code == 401, f"{key} has no authentication"
@@ -213,7 +262,20 @@ def test_every_route_is_public_self_verifying_or_operator_authenticated(client, 
         ("GET", "/heartbeat/status"),
     }
     listed = {(m.upper(), p) for p, ops in app.openapi()["paths"].items() for m in ops}
-    assert _PUBLIC | _OWN_HMAC <= listed
+    assert _PUBLIC | set(_OWN_HMAC) <= listed
+
+    # With one secret per purpose, each authenticated route accepts its own
+    # purpose's secret and refuses the other three.
+    _configure(monkeypatch, **{p.replace("-", "_"): s for p, s in _SPLIT.items()})
+    monkeypatch.setattr(receipt_routes, "_service", MagicMock())
+    purposes = {key: "operator" for key in protected} | _OWN_HMAC
+    for key, purpose in purposes.items():
+        for holder, secret in _SPLIT.items():
+            status = _call_as(client, key, purpose, secret).status_code
+            if holder == purpose:
+                assert status not in (401, 503), f"{key} refused its own secret"
+            else:
+                assert status == 401, f"{key} accepted the {holder} secret"
 
 
 # ---------------------------------------------------------------------------
@@ -564,39 +626,48 @@ def test_opt_out_defaults_to_off():
 
 
 def test_startup_warns_loudly_when_the_opt_out_is_active(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "webhook_secret", "")
+    _configure(monkeypatch)
     monkeypatch.setattr(settings, "allow_unauthenticated", True)
     with caplog.at_level(logging.WARNING, logger=webhook_listener.logger.name):
         webhook_listener._log_auth_posture()
-    [record] = caplog.records
+    [record] = [r for r in caplog.records if r.getMessage().startswith("INSECURE")]
     assert record.levelno == logging.WARNING
     text = record.getMessage()
-    assert text.startswith("INSECURE")
     assert "MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED" in text
     assert "UNAUTHENTICATED" in text
+    assert "/webhook" in text and "operator routes" in text
+    # The opt-out never covers these two; they are reported as refusing.
+    [refusing] = [r for r in caplog.records if "503" in r.getMessage()]
+    assert "/api/v1/verify-patch" in refusing.getMessage()
+    assert "POST /api/v1/receipts" in refusing.getMessage()
+    assert "/webhook" not in refusing.getMessage()
 
 
 def test_startup_warns_when_no_secret_and_no_opt_out(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "webhook_secret", "")
+    _configure(monkeypatch)
     monkeypatch.setattr(settings, "allow_unauthenticated", False)
     with caplog.at_level(logging.WARNING, logger=webhook_listener.logger.name):
         webhook_listener._log_auth_posture()
     [record] = caplog.records
-    assert "503" in record.getMessage()
+    text = record.getMessage()
+    assert "503" in text
+    for what in ("/webhook", "operator routes", "/api/v1/verify-patch", "/api/v1/receipts"):
+        assert what in text
 
 
 def test_startup_says_the_opt_out_is_ignored_with_a_secret(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "webhook_secret", _SECRET)
+    _configure(monkeypatch, webhook=_SECRET)
     monkeypatch.setattr(settings, "allow_unauthenticated", True)
     with caplog.at_level(logging.WARNING, logger=webhook_listener.logger.name):
         webhook_listener._log_auth_posture()
-    [record] = caplog.records
-    assert "ignored" in record.getMessage()
-    assert _SECRET not in record.getMessage()
+    [record] = [r for r in caplog.records if "ignored" in r.getMessage()]
+    assert "MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED" in record.getMessage()
+    assert not any(r.getMessage().startswith("INSECURE") for r in caplog.records)
+    assert all(_SECRET not in r.getMessage() for r in caplog.records)
 
 
-def test_startup_is_quiet_when_configured(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "webhook_secret", _SECRET)
+def test_startup_is_quiet_when_every_purpose_has_its_own_secret(monkeypatch, caplog):
+    _configure(monkeypatch, **{p.replace("-", "_"): s for p, s in _SPLIT.items()})
     monkeypatch.setattr(settings, "allow_unauthenticated", False)
     with caplog.at_level(logging.WARNING, logger=webhook_listener.logger.name):
         webhook_listener._log_auth_posture()
@@ -612,3 +683,289 @@ def test_lifespan_logs_the_posture(tmp_path, monkeypatch):
     with TestClient(app):
         pass
     called.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Per-purpose secrets
+# ---------------------------------------------------------------------------
+
+_PURPOSE_KEY = {
+    "webhook": ("POST", "/webhook"),
+    "operator": ("GET", "/merkle"),
+    "verify-patch": ("POST", "/api/v1/verify-patch"),
+    "receipts": ("POST", "/api/v1/receipts"),
+}
+_UNCONFIGURED_DETAIL = {
+    "webhook": "webhook requires MEDIATOR_WEBHOOK_SECRET",
+    "operator": _UNCONFIGURED,
+    "verify-patch": "verify-patch requires MEDIATOR_WEBHOOK_SECRET",
+    "receipts": "receipts require MEDIATOR_WEBHOOK_SECRET",
+}
+_split_purpose = pytest.mark.parametrize("purpose", _SPLIT_PURPOSES)
+
+
+@pytest.fixture
+def split(client, monkeypatch):
+    """The client, with receipts mounted so POST /api/v1/receipts reaches its check."""
+    monkeypatch.setattr(settings, "receipts_enabled", True)
+    monkeypatch.setattr(receipt_routes, "_service", MagicMock())
+    return client
+
+
+def _status(client, purpose: str, secret: str | None) -> int:
+    return _call_as(client, _PURPOSE_KEY[purpose], purpose, secret).status_code
+
+
+def _accepted(client, purpose: str, secret: str | None) -> bool:
+    status = _status(client, purpose, secret)
+    assert status != 503, f"{purpose} is unconfigured"
+    return status != 401
+
+
+def _kw(**by_purpose: str) -> dict[str, str]:
+    return {purpose.replace("-", "_"): secret for purpose, secret in by_purpose.items()}
+
+
+def test_new_settings_default_to_unset():
+    from a2a_settlement_mediator.config import MediatorSettings
+
+    for attr, env in (
+        ("operator_secret", "MEDIATOR_OPERATOR_SECRET"),
+        ("verify_patch_secret", "MEDIATOR_VERIFY_PATCH_SECRET"),
+        ("receipts_secret", "MEDIATOR_RECEIPTS_SECRET"),
+    ):
+        if not os.getenv(env):
+            assert getattr(MediatorSettings, attr) == ""
+    if not os.getenv("MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK"):
+        assert MediatorSettings.secret_transition_accept_fallback is False
+
+
+@pytest.mark.parametrize("purpose", list(_PURPOSE_KEY))
+def test_only_the_webhook_secret_set_keys_every_purpose(split, purpose):
+    """A deployment that sets nothing new behaves as before."""
+    assert _accepted(split, purpose, _SECRET)
+    assert not _accepted(split, purpose, "other")
+    assert not _accepted(split, purpose, "")
+
+
+@_split_purpose
+def test_own_secret_replaces_the_webhook_secret(split, monkeypatch, purpose):
+    _configure(monkeypatch, webhook=_SECRET, **_kw(**{purpose: _SPLIT[purpose]}))
+    assert _accepted(split, purpose, _SPLIT[purpose])
+    assert not _accepted(split, purpose, _SECRET)
+    # The purposes without their own secret still use the webhook secret,
+    # and none of them accepts this purpose's secret.
+    for other in _PURPOSE_KEY:
+        if other != purpose:
+            assert _accepted(split, other, _SECRET), other
+            assert not _accepted(split, other, _SPLIT[purpose]), other
+
+
+@_split_purpose
+def test_own_secret_works_without_a_webhook_secret(split, monkeypatch, purpose):
+    _configure(monkeypatch, **_kw(**{purpose: _SPLIT[purpose]}))
+    assert _accepted(split, purpose, _SPLIT[purpose])
+    assert not _accepted(split, purpose, "")
+    # Everything else has no secret at all and stays closed.
+    for other in _PURPOSE_KEY:
+        if other != purpose:
+            for secret in (None, "", _SPLIT[purpose]):
+                resp = _call_as(split, _PURPOSE_KEY[other], other, secret)
+                assert resp.status_code == 503, other
+                assert resp.json()["detail"] == _UNCONFIGURED_DETAIL[other]
+
+
+@pytest.mark.parametrize("purpose", list(_PURPOSE_KEY))
+@pytest.mark.parametrize("transition", [False, True])
+def test_no_secret_at_all_refuses(split, monkeypatch, purpose, transition):
+    _configure(monkeypatch, transition=transition)
+    for secret in (None, ""):
+        resp = _call_as(split, _PURPOSE_KEY[purpose], purpose, secret)
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == _UNCONFIGURED_DETAIL[purpose]
+
+
+def test_webhook_never_accepts_a_purpose_secret(split, monkeypatch):
+    _configure(monkeypatch, transition=True, **_kw(**_SPLIT))
+    assert _accepted(split, "webhook", _SPLIT["webhook"])
+    for purpose in _SPLIT_PURPOSES:
+        assert not _accepted(split, "webhook", _SPLIT[purpose])
+
+
+@_split_purpose
+def test_transition_accepts_the_own_and_the_webhook_secret(split, monkeypatch, purpose):
+    _configure(monkeypatch, transition=True, **_kw(**_SPLIT))
+    assert _accepted(split, purpose, _SPLIT[purpose])
+    assert _accepted(split, purpose, _SPLIT["webhook"])
+    for other in _SPLIT_PURPOSES:
+        if other != purpose:
+            assert not _accepted(split, purpose, _SPLIT[other]), other
+    assert not _accepted(split, purpose, "")
+
+
+@_split_purpose
+def test_transition_is_off_unless_asked_for(split, monkeypatch, purpose):
+    _configure(monkeypatch, **_kw(**_SPLIT))
+    assert not _accepted(split, purpose, _SPLIT["webhook"])
+
+
+@_split_purpose
+def test_transition_never_accepts_an_empty_key(split, monkeypatch, purpose):
+    _configure(monkeypatch, transition=True, **_kw(**{purpose: _SPLIT[purpose]}))
+    assert _accepted(split, purpose, _SPLIT[purpose])
+    assert not _accepted(split, purpose, "")
+    assert _status(split, purpose, None) == 401
+
+
+@_split_purpose
+def test_transition_does_nothing_for_a_purpose_without_its_own_secret(
+    split, monkeypatch, purpose
+):
+    others = {p: s for p, s in _SPLIT.items() if p != purpose}
+    _configure(monkeypatch, transition=True, **_kw(**others))
+    assert _accepted(split, purpose, _SPLIT["webhook"])
+    for other in _SPLIT_PURPOSES:
+        if other != purpose:
+            assert not _accepted(split, purpose, _SPLIT[other])
+
+
+def test_replay_is_refused_whichever_secret_signed(split, monkeypatch):
+    _configure(monkeypatch, transition=True, **_kw(**_SPLIT))
+    for secret in (_SPLIT["operator"], _SPLIT["webhook"]):
+        headers = _sign("GET", "/merkle", None, secret=secret)
+        assert _send(split, "GET", "/merkle", None, headers).status_code == 200
+        assert _send(split, "GET", "/merkle", None, headers).status_code == 409
+
+
+def test_verify_patch_signature_is_not_valid_for_receipts(split, monkeypatch):
+    """Both use ``{timestamp}.{body}``; separate secrets keep them apart."""
+    _configure(monkeypatch, **_kw(**_SPLIT))
+    assert not _accepted(split, "receipts", _SPLIT["verify-patch"])
+    assert not _accepted(split, "verify-patch", _SPLIT["receipts"])
+
+
+def test_opt_out_is_ignored_for_a_purpose_with_its_own_secret(split, monkeypatch):
+    """No webhook secret, opt-out on: /webhook is open, the keyed operator routes are not."""
+    _configure(monkeypatch, operator=_SPLIT["operator"])
+    monkeypatch.setattr(settings, "allow_unauthenticated", True)
+    assert _status(split, "operator", None) == 401
+    assert _accepted(split, "operator", _SPLIT["operator"])
+    assert _accepted(split, "webhook", None)
+
+
+def test_opt_out_never_covers_verify_patch_or_receipts(split, monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(settings, "allow_unauthenticated", True)
+    assert _accepted(split, "webhook", None)
+    assert _status(split, "operator", None) == 200
+    for purpose in ("verify-patch", "receipts"):
+        for secret in (None, ""):
+            assert _status(split, purpose, secret) == 503
+
+
+def test_opt_out_is_ignored_when_only_the_webhook_secret_is_set(split, monkeypatch):
+    monkeypatch.setattr(settings, "allow_unauthenticated", True)
+    for purpose in _PURPOSE_KEY:
+        assert _status(split, purpose, None) == 401, purpose
+
+
+# ---------------------------------------------------------------------------
+# Startup posture for per-purpose secrets
+# ---------------------------------------------------------------------------
+
+
+def _posture(caplog) -> tuple[str, list[str]]:
+    with caplog.at_level(logging.INFO, logger=webhook_listener.logger.name):
+        webhook_listener._log_auth_posture()
+    [info] = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    return info, warnings
+
+
+def test_posture_names_each_purpose_and_no_values(monkeypatch, caplog):
+    _configure(monkeypatch, webhook=_SPLIT["webhook"], operator=_SPLIT["operator"])
+    monkeypatch.setattr(settings, "allow_unauthenticated", False)
+    info, warnings = _posture(caplog)
+    assert info == (
+        "Request signing secrets: webhook: MEDIATOR_WEBHOOK_SECRET; "
+        "operator: MEDIATOR_OPERATOR_SECRET (own secret); "
+        "verify-patch: shares MEDIATOR_WEBHOOK_SECRET; "
+        "receipts: shares MEDIATOR_WEBHOOK_SECRET"
+    )
+    # Some purposes are separated, so the all-shared warning does not fire.
+    assert warnings == []
+    for secret in _SPLIT.values():
+        assert secret not in caplog.text
+
+
+def test_posture_warns_when_every_purpose_shares_one_secret(monkeypatch, caplog):
+    _configure(monkeypatch, webhook=_SECRET)
+    monkeypatch.setattr(settings, "allow_unauthenticated", False)
+    info, warnings = _posture(caplog)
+    assert info.count("shares MEDIATOR_WEBHOOK_SECRET") == 3
+    [warning] = warnings
+    assert warning.startswith("One secret (MEDIATOR_WEBHOOK_SECRET)")
+    for name in (
+        "MEDIATOR_OPERATOR_SECRET",
+        "MEDIATOR_VERIFY_PATCH_SECRET",
+        "MEDIATOR_RECEIPTS_SECRET",
+    ):
+        assert name in warning
+    assert _SECRET not in caplog.text
+
+
+def test_posture_counts_a_copied_value_as_shared(monkeypatch, caplog):
+    """Setting every purpose secret to the webhook secret's value separates nothing."""
+    _configure(monkeypatch, **_kw(**dict.fromkeys(_PURPOSE_ATTR, _SECRET)))
+    monkeypatch.setattr(settings, "allow_unauthenticated", False)
+    info, warnings = _posture(caplog)
+    assert info.count("(same value as MEDIATOR_WEBHOOK_SECRET)") == 3
+    assert [w for w in warnings if w.startswith("One secret")]
+    assert _SECRET not in caplog.text
+
+
+def test_posture_reports_two_purposes_with_the_same_own_value(monkeypatch, caplog):
+    secrets = dict(_SPLIT, receipts=_SPLIT["operator"])
+    _configure(monkeypatch, **_kw(**secrets))
+    info, _warnings = _posture(caplog)
+    assert "receipts: MEDIATOR_RECEIPTS_SECRET (same value as MEDIATOR_OPERATOR_SECRET)" in info
+
+
+def test_posture_warns_while_the_transition_is_on(monkeypatch, caplog):
+    _configure(monkeypatch, transition=True, webhook=_SPLIT["webhook"], operator=_SPLIT["operator"])
+    monkeypatch.setattr(settings, "allow_unauthenticated", False)
+    info, warnings = _posture(caplog)
+    assert (
+        "operator: MEDIATOR_OPERATOR_SECRET (transition: MEDIATOR_WEBHOOK_SECRET also accepted)"
+        in info
+    )
+    [warning] = warnings
+    assert warning.startswith("MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK is on")
+    assert "MEDIATOR_OPERATOR_SECRET" in warning
+    assert "MEDIATOR_RECEIPTS_SECRET" not in warning
+
+
+def test_posture_says_when_the_transition_has_no_effect(monkeypatch, caplog):
+    _configure(monkeypatch, transition=True, **_kw(**dict(_SPLIT, webhook="")))
+    monkeypatch.setattr(settings, "allow_unauthenticated", False)
+    _info, warnings = _posture(caplog)
+    assert any("has no effect" in w for w in warnings)
+
+
+def test_posture_reports_unset_purposes(monkeypatch, caplog):
+    _configure(monkeypatch, operator=_SPLIT["operator"])
+    monkeypatch.setattr(settings, "allow_unauthenticated", False)
+    info, warnings = _posture(caplog)
+    assert "webhook: not set" in info
+    assert "verify-patch: not set" in info
+    [warning] = warnings
+    assert "503" in warning
+    assert "operator routes" not in warning
+
+
+def test_posture_opt_out_names_only_the_open_purposes(monkeypatch, caplog):
+    _configure(monkeypatch, operator=_SPLIT["operator"])
+    monkeypatch.setattr(settings, "allow_unauthenticated", True)
+    _info, warnings = _posture(caplog)
+    [insecure] = [w for w in warnings if w.startswith("INSECURE")]
+    assert "no secret is set for /webhook." in insecure

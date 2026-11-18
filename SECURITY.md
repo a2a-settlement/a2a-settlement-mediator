@@ -20,7 +20,7 @@ The adversary does **not** control:
 - The exchange's escrow records or transaction history
 - The counterparty's reputation score or dispute history
 - The mediator's system prompt, decision framework, or confidence threshold
-- The mediator's `MEDIATOR_WEBHOOK_SECRET` or its operator API key
+- The mediator's request-signing secrets (`MEDIATOR_WEBHOOK_SECRET` and the per-purpose secrets) or its operator API key
 - The timestamping authority
 
 ### Threat Categories
@@ -49,7 +49,31 @@ The mediator uses layered defenses. No single control is sufficient. Each statem
 
 ### Layer 1: Request Authentication and Ingestion Controls
 
-**One shared secret, three signature forms.** Every authenticated route uses HMAC-SHA256 keyed with `MEDIATOR_WEBHOOK_SECRET`. Anyone who holds that secret can call every authenticated route; there are no per-caller keys or roles.
+**Four purposes, three signature forms.** Every authenticated route uses HMAC-SHA256. Each route belongs to one purpose, and each purpose can have its own secret:
+
+| Purpose | Routes | Usual caller | Its own secret |
+|---|---|---|---|
+| webhook | `POST /webhook` | the exchange | `MEDIATOR_WEBHOOK_SECRET` |
+| operator | `/mediate`, `/audits`, `/settle`, `/settlements*`, `/merkle`, `/heartbeat/status` | an operator backend | `MEDIATOR_OPERATOR_SECRET` |
+| verify-patch | `POST /api/v1/verify-patch` | an operator backend | `MEDIATOR_VERIFY_PATCH_SECRET` |
+| receipts | `POST /api/v1/receipts` | an operator backend | `MEDIATOR_RECEIPTS_SECRET` |
+
+The three per-purpose secrets are optional. Which secret a signature must be keyed with:
+
+| The purpose's own secret | `MEDIATOR_WEBHOOK_SECRET` | Accepted for that purpose |
+|---|---|---|
+| set | set or empty | the purpose's own secret only |
+| empty | set | `MEDIATOR_WEBHOOK_SECRET` |
+| empty | empty | nothing: 503 (see "Fail closed") |
+| set, and `MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK=true` | set | either of the two |
+
+`/webhook` only ever accepts `MEDIATOR_WEBHOOK_SECRET`. A purpose never accepts another purpose's secret, and an empty value is never used as a key.
+
+With only `MEDIATOR_WEBHOOK_SECRET` set, one secret keys everything: whoever holds the exchange's webhook secret can also trigger mediations and issue receipts. Setting the per-purpose secrets to different values removes that. There are still no per-caller keys or roles within a purpose: anyone who holds the operator secret can call every operator route.
+
+At startup the mediator logs one line naming, for each purpose, the setting its secret comes from (for example `operator: MEDIATOR_OPERATOR_SECRET (own secret)` or `receipts: shares MEDIATOR_WEBHOOK_SECRET`). It never logs a value. It logs a warning when every purpose uses the same secret, including when the per-purpose settings were given the webhook secret's value, and another while the transition setting is on.
+
+The signature forms are unchanged by the choice of secret:
 
 | Routes | Headers | Signed message | Replay protection |
 |---|---|---|---|
@@ -64,9 +88,27 @@ For the operator routes in the third row:
 - A timestamp more than `MEDIATOR_SIGNATURE_TOLERANCE_S` seconds (default 300) from the mediator's clock is rejected with 401. A verified signature is recorded until its window closes, and a second presentation is rejected with 409. The record lives in the mediator's SQLite database, so it survives a restart.
 - Missing, malformed or wrong headers are rejected with 401 before the route handler runs.
 
-**Fail closed.** With `MEDIATOR_WEBHOOK_SECRET` empty, `/webhook`, the operator routes, `/api/v1/verify-patch` and `POST /api/v1/receipts` refuse every request with 503. The mediator logs a warning at startup when the secret is empty.
+**Fail closed.** A purpose with neither its own secret nor `MEDIATOR_WEBHOOK_SECRET` refuses every request with 503. With all four settings empty that is `/webhook`, the operator routes, `/api/v1/verify-patch` and `POST /api/v1/receipts`. The mediator logs a warning at startup naming the purposes that have no secret.
 
-**Development opt-out.** `MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED=true` (default off) makes `/webhook` and the operator routes accept unsigned requests, but only while `MEDIATOR_WEBHOOK_SECRET` is empty. When a secret is set the opt-out is ignored. It does not apply to `/api/v1/verify-patch` or `POST /api/v1/receipts`. The mediator logs a warning beginning `INSECURE` at startup when the opt-out is active. Do not use it on any deployment that other hosts can reach: `/mediate` resolves escrows on the exchange with the operator API key.
+**Development opt-out.** `MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED=true` (default off) makes `/webhook` and the operator routes accept unsigned requests, but only for a purpose that has no secret: `/webhook` while `MEDIATOR_WEBHOOK_SECRET` is empty, the operator routes while both `MEDIATOR_OPERATOR_SECRET` and `MEDIATOR_WEBHOOK_SECRET` are empty. When a purpose has a secret the opt-out is ignored for it. It does not apply to `/api/v1/verify-patch` or `POST /api/v1/receipts`. The mediator logs a warning beginning `INSECURE` at startup when the opt-out is active. Do not use it on any deployment that other hosts can reach: `/mediate` resolves escrows on the exchange with the operator API key.
+
+#### Moving from one shared secret to separate secrets
+
+A purpose that has its own secret refuses `MEDIATOR_WEBHOOK_SECRET`. Accepting both permanently would leave the webhook secret as a master key, so the split would protect nothing. Refusing it the moment the new secret is set would make every call fail between the mediator's restart and the caller's. `MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK` covers that gap: it is off by default, has to be turned on deliberately, is reported in a warning at every startup while it is on, and only ever adds `MEDIATOR_WEBHOOK_SECRET`, never another purpose's secret.
+
+To separate the secrets on a running deployment without a rejected request:
+
+1. Upgrade the mediator and the calling backend to versions that support the per-purpose settings. Change no settings. Behaviour is unchanged, and the mediator's startup log warns that one secret signs everything.
+2. Generate a new random value for each purpose you are separating. On the mediator, set the per-purpose secrets and `MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK=true`, then restart the mediator. It now accepts the new secret or the webhook secret for those purposes. The backend is still signing with the webhook secret, which still works.
+3. On the backend, set the same per-purpose secrets and restart it. It now signs each kind of call with that purpose's secret. Check that mediations, patch verifications and receipts succeed.
+4. On the mediator, set `MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK=false` (or remove it) and restart. The webhook secret is now refused on the separated purposes. The startup log shows `(own secret)` for each and no transition warning.
+5. Remove `MEDIATOR_WEBHOOK_SECRET` from the backend if nothing there still uses it, so the backend no longer holds the exchange's secret.
+
+Only set a purpose's secret on the mediator if its caller can sign with it. If a caller still signs with the webhook secret, leave that purpose's setting empty; it keeps working as before.
+
+The steps do not change `MEDIATOR_WEBHOOK_SECRET` itself. The backend knew that value before the split, so to finish, rotate it with the exchange. `/webhook` accepts exactly one secret, so that rotation is a separate procedure and deliveries signed with the old value are rejected once the mediator has the new one.
+
+To rotate one purpose's secret later, there is no second slot: the mediator and the caller must change together, and calls fail between the two restarts.
 
 **Unauthenticated routes.** `GET /health` (service name, version, auto-resolve threshold, LLM model name, guide URL), `GET /guide` (the bounty design guide from this repository) and `GET /schemas` (JSON Schemas generated from the model classes in this repository) need no signature. None of them reads deployment state other than the configuration values listed for `/health`. When receipts are enabled, `GET /api/v1/receipts/{receipt_id}`, `POST /api/v1/receipts/verify` and `GET /.well-known/settlebridge-receipt-keys.json` are also unauthenticated. FastAPI's generated `/docs`, `/redoc` and `/openapi.json` are served without authentication as well; they describe the API and contain no deployment data.
 

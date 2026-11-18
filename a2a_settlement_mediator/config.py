@@ -101,7 +101,20 @@ class MediatorSettings:
     webhook_host: str = os.getenv("MEDIATOR_HOST", "127.0.0.1")
     webhook_port: int = _get_int("MEDIATOR_PORT", 3100)
     # The webhook secret assigned by the exchange when the mediator registers its webhook.
+    # It keys /webhook, and every other signed route that has no secret of its own.
     webhook_secret: str = os.getenv("MEDIATOR_WEBHOOK_SECRET", "")
+    # Optional per-purpose secrets. Empty means that purpose uses webhook_secret.
+    # When one is set, the webhook secret is no longer accepted for that purpose
+    # (except while secret_transition_accept_fallback is on).
+    operator_secret: str = os.getenv("MEDIATOR_OPERATOR_SECRET", "")
+    verify_patch_secret: str = os.getenv("MEDIATOR_VERIFY_PATCH_SECRET", "")
+    receipts_secret: str = os.getenv("MEDIATOR_RECEIPTS_SECRET", "")
+    # Rollout aid, off by default. While on, a purpose that has its own secret
+    # also accepts the webhook secret, so callers can be switched over without a
+    # failed request. Turn it off again once every caller signs with its own secret.
+    secret_transition_accept_fallback: bool = _get_bool(
+        "MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK", False
+    )
     # Verify-patch and the operator routes reject timestamps farther than this
     # many seconds from now.
     signature_tolerance_seconds: int = _get_int("MEDIATOR_SIGNATURE_TOLERANCE_S", 300)
