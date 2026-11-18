@@ -585,10 +585,12 @@ def trigger_settlement(req: SettlementRequest):
         agent_identities=identities,
         currency_precision=precision,
     )
-    result_json = result.model_dump_json()
-    settlement_hash = result.settlement_hash if hasattr(result, "settlement_hash") else ""
-    if settlement_hash:
-        storage.save_settlement_result(settlement_hash, result_json)
+    # A settlement is stored under the hash in its proof. A result with no
+    # proof (rejected by arbitration, or aborted at a later stage) was never
+    # timestamped or added to the Merkle tree, so it has no hash to key on and
+    # is returned to the caller without being stored.
+    if result.proof is not None:
+        storage.save_settlement_result(result.proof.settlement_hash, result.model_dump_json())
 
     return result.model_dump(mode="json")
 
