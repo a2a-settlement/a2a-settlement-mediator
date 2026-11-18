@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -38,7 +39,8 @@ _TSA_ENV = (
     "MEDIATOR_TSA_CA_BUNDLE",
     "MEDIATOR_TSA_TIMEOUT",
 )
-_WORKTREE = "/tmp/med-w15-commercial-tsa"
+# Repo root, so child processes import this checkout wherever it lives.
+_WORKTREE = str(Path(__file__).resolve().parent.parent)
 _TOKEN = "super-secret-token"
 
 
