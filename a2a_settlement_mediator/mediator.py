@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -39,6 +40,7 @@ from a2a_settlement_mediator.schemas import (
     ProvenanceResult,
     Resolution,
     StructuredDiagnostic,
+    StructuredEvidence,
     Verdict,
     VerdictOutcome,
 )
@@ -62,34 +64,151 @@ def _build_mediator_context() -> MediatorContext:
     )
 
 
-def _decrypt_evidence_artifacts(evidence) -> None:
-    """Decrypt encrypted evidence bundles using the vault/TEE key.
+# Marker placed in a verdict's ``factors`` when encrypted evidence forced escalation.
+UNREADABLE_EVIDENCE_FACTOR = "ENCRYPTED_EVIDENCE_UNREADABLE"
 
-    Modifies evidence in place, replacing encrypted artifact content with
-    decrypted plaintext. Only the mediator (in TEE) can perform this.
-    The public provenance chain retains only the content hash.
+# The evidence types the exchange accepts. Anything else on an unreadable
+# submission is recorded as "unknown" instead of being passed through.
+_KNOWN_EVIDENCE_TYPES = frozenset(
+    {"compute", "content", "service", "bounty", "third_party_attestation"}
+)
+_SHA256_HEX = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+
+
+def _withhold_encrypted_evidence(evidence) -> dict[str, int]:
+    """Replace encrypted evidence submissions with unreadable placeholders.
+
+    The mediator cannot decrypt evidence: it holds no decryption key, the
+    exchange defines no ciphertext format or key wrapping, and the exchange's
+    evidence listing returns neither artifacts nor ``encryption_key_id``. A
+    submission the exchange marks ``encrypted`` is therefore present but
+    unreadable.
+
+    Each such submission is replaced, in place in the bundle, by a placeholder
+    that keeps only what the exchange itself assigned or validated (id,
+    submitter, source, a recognised evidence type, a well-formed content hash,
+    the submission time) and sets ``readable=False``. Every field the submitter
+    wrote freely (summary, artifacts, key id, attestor fields) is dropped, so
+    neither ciphertext nor text placed next to it reaches the LLM prompt, the
+    escalation notice or the audit record. The original stays on the exchange
+    under the same submission id.
+
+    Returns the number of submissions withheld per party
+    (``"requester"``, ``"provider"``, ``"oracle"``), omitting parties with none.
     """
-    for party_evidence in (evidence.requester_evidence, evidence.provider_evidence):
-        for submission in party_evidence:
-            if not submission.encrypted or not submission.encryption_key_id:
+    withheld: dict[str, int] = {}
+    for party, submissions in (
+        ("requester", evidence.requester_evidence),
+        ("provider", evidence.provider_evidence),
+        ("oracle", evidence.oracle_evidence),
+    ):
+        for index, submission in enumerate(submissions):
+            if not submission.encrypted:
                 continue
-            try:
-                from a2a_settlement_auth.vault import SecretVault
-                from a2a_settlement_auth.vault_store import InMemoryVaultStore
+            artifact_count = len(submission.artifacts)
+            submissions[index] = StructuredEvidence(
+                id=submission.id,
+                submitter_id=submission.submitter_id,
+                evidence_type=(
+                    submission.evidence_type
+                    if submission.evidence_type in _KNOWN_EVIDENCE_TYPES
+                    else "unknown"
+                ),
+                summary=(
+                    "[Withheld by the mediator: this submission was marked encrypted "
+                    f"and could not be read. {artifact_count} "
+                    f"artifact{'' if artifact_count == 1 else 's'} not shown.]"
+                ),
+                artifacts=[],
+                encrypted=True,
+                readable=False,
+                content_hash=(
+                    submission.content_hash
+                    if _SHA256_HEX.match(submission.content_hash)
+                    else ""
+                ),
+                source_type=submission.source_type,
+                oracle_id=submission.oracle_id,
+                submitted_at=submission.submitted_at,
+            )
+            withheld[party] = withheld.get(party, 0) + 1
+    if withheld:
+        logger.warning(
+            "Escrow %s has encrypted evidence the mediator cannot read (%s); "
+            "content withheld, dispute will be escalated",
+            evidence.escrow.escrow_id,
+            ", ".join(f"{party}: {count}" for party, count in withheld.items()),
+        )
+    return withheld
 
-                vault = SecretVault(store=InMemoryVaultStore())
-                for artifact in submission.artifacts:
-                    if artifact.get("content") and artifact.get("artifact_type") == "inline":
-                        decrypted = vault.resolve(submission.encryption_key_id)
-                        if decrypted:
-                            logger.info(
-                                "Decrypted evidence artifact for submission %s",
-                                submission.id,
-                            )
-            except ImportError:
-                logger.warning("a2a-settlement-auth not available for evidence decryption")
-            except Exception as exc:
-                logger.error("Evidence decryption failed: %s", exc)
+
+def _party_phrase(party: str) -> str:
+    return "an oracle" if party == "oracle" else f"the {party}"
+
+
+def _evidence_prompt_block(submissions, party: str, withheld: dict[str, int]) -> str | None:
+    """Serialise one party's evidence submissions for the LLM prompt.
+
+    When any of that party's submissions were withheld as unreadable, the JSON
+    is preceded by a notice in the mediator's own words saying so.
+    """
+    if not submissions:
+        return None
+    block = json.dumps([e.model_dump(mode="json") for e in submissions], indent=2)
+    count = withheld.get(party, 0)
+    if not count:
+        return block
+    notice = (
+        f"NOTICE FROM THE MEDIATOR (not written by any party): {count} evidence "
+        f"submission{'' if count == 1 else 's'} from {_party_phrase(party)} "
+        f"{'was' if count == 1 else 'were'} marked encrypted. The mediator cannot "
+        "decrypt evidence, so the content could not be read and is not shown; the "
+        'entries below with "readable": false are placeholders. Treat that content '
+        "as absent: do not guess what it contains and do not count it for or "
+        "against either party. Base your assessment on the readable evidence only. "
+        "Because evidence could not be read, this dispute goes to human review "
+        "whatever you conclude."
+    )
+    return f"{notice}\n\n{block}"
+
+
+def _apply_unreadable_evidence_policy(verdict: Verdict, withheld: dict[str, int]) -> Verdict:
+    """Send a dispute with unreadable evidence to human review.
+
+    The mediator will not execute a resolution when a submission could not be
+    read: ruling against a party whose evidence was never seen is unsafe, and
+    ruling for one would reward marking evidence encrypted. The model's
+    assessment of the readable evidence is kept in the reasoning for the
+    reviewer, but it is not executed whatever its confidence.
+    """
+    if not withheld:
+        return verdict
+    parties = ", ".join(
+        f"{_party_phrase(party)} ({count})" for party, count in withheld.items()
+    )
+    if verdict.resolution is not None:
+        assessment = (
+            f"On the readable evidence alone the model suggested "
+            f"{verdict.resolution.value} at {verdict.confidence:.0%} confidence; "
+            f"that was not executed. Model reasoning: {verdict.reasoning}"
+        )
+    else:
+        assessment = f"Assessment of the readable evidence: {verdict.reasoning}"
+    factors = list(verdict.factors)
+    if UNREADABLE_EVIDENCE_FACTOR not in factors:
+        factors.append(UNREADABLE_EVIDENCE_FACTOR)
+    return verdict.model_copy(
+        update={
+            "outcome": VerdictOutcome.ESCALATE,
+            "resolution": None,
+            "reasoning": (
+                f"Escalated to human review: evidence marked encrypted was submitted "
+                f"by {parties} and could not be read by the mediator, which has no "
+                f"means of decrypting evidence. {assessment}"
+            ),
+            "factors": factors,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -551,8 +670,9 @@ def mediate(
     # 1. Collect evidence (including structured submissions from both parties)
     evidence = collect_evidence(escrow_id)
 
-    # 1b. Decrypt encrypted evidence if present (TEE/vault)
-    _decrypt_evidence_artifacts(evidence)
+    # 1b. Withhold encrypted evidence. The mediator cannot decrypt it, so it is
+    # carried as present-but-unreadable and the dispute is escalated (step 3b).
+    unreadable_evidence = _withhold_encrypted_evidence(evidence)
 
     # 1.5 — Anti-self-dealing pre-flight: short-circuit before any LLM call.
     # Hard self-dealing → null-resolution (no LLM, no EMA movement, refund to requester).
@@ -666,24 +786,14 @@ def mediate(
     # This prevents silent truncation producing false high-confidence verdicts.
     import json as _json_mod
 
-    req_ev_json = (
-        _json_mod.dumps(
-            [e.model_dump(mode="json") for e in evidence.requester_evidence], indent=2
-        )
-        if evidence.requester_evidence
-        else None
+    req_ev_json = _evidence_prompt_block(
+        evidence.requester_evidence, "requester", unreadable_evidence
     )
-    prov_ev_json = (
-        _json_mod.dumps(
-            [e.model_dump(mode="json") for e in evidence.provider_evidence], indent=2
-        )
-        if evidence.provider_evidence
-        else None
+    prov_ev_json = _evidence_prompt_block(
+        evidence.provider_evidence, "provider", unreadable_evidence
     )
-    oracle_ev_json = (
-        _json_mod.dumps([e.model_dump(mode="json") for e in evidence.oracle_evidence], indent=2)
-        if evidence.oracle_evidence
-        else None
+    oracle_ev_json = _evidence_prompt_block(
+        evidence.oracle_evidence, "oracle", unreadable_evidence
     )
 
     deliverable_size_bytes = len(delivered_content.encode("utf-8")) if delivered_content else 0
@@ -814,6 +924,9 @@ def mediate(
                 reasoning=f"LLM evaluation failed: {exc}",
             )
             error = str(exc)
+
+    # 3b. Evidence that could not be read: never auto-resolve, escalate instead.
+    verdict = _apply_unreadable_evidence_policy(verdict, unreadable_evidence)
 
     # 4. Execute or escalate
     provenance_result_dict = provenance_result.model_dump() if provenance_result else None

@@ -80,6 +80,12 @@ class StructuredEvidence(BaseModel):
     summary: str
     artifacts: list[dict] = []
     encrypted: bool = False
+    # The submitter's label for the key the content was encrypted to, as stored
+    # by the exchange. The mediator holds no keys; this is carried, never used.
+    encryption_key_id: str | None = None
+    # False once the mediator has withheld this submission's content because it
+    # was marked encrypted and could not be read (see mediator.py).
+    readable: bool = True
     content_hash: str = ""
     attestor_id: str | None = None
     attestor_signature: str | None = None
