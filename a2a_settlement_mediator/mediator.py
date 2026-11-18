@@ -326,9 +326,10 @@ def _null_resolution(
     """Return funds to requester without LLM arbitration for confirmed self-dealing.
 
     No EMA movement, no ATE reward on either side. Adds a compliance queue
-    entry so the operator can review the pattern.
+    entry so the operator can review the pattern. Like every other path
+    through ``mediate``, the audit record is returned for the caller to store.
     """
-    from a2a_settlement_mediator.storage import add_compliance_queue_entry, save_audit_record
+    from a2a_settlement_mediator.storage import add_compliance_queue_entry
 
     logger.warning(
         "Null-resolving self-dealing dispute for escrow %s — refunding requester without LLM",
@@ -373,7 +374,6 @@ def _null_resolution(
         error=error,
         evaluation_method="structural_error",
     )
-    save_audit_record(escrow_id, audit.model_dump_json())
     return audit
 
 

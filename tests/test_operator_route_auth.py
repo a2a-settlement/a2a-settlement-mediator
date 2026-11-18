@@ -83,7 +83,7 @@ def handlers(monkeypatch):
         return_value=MagicMock(
             model_dump=lambda mode: {"stage": "confirmed"},
             model_dump_json=lambda: '{"stage": "confirmed"}',
-            settlement_hash="",
+            proof=None,
         )
     )
     monkeypatch.setattr(webhook_listener, "mediate", mediate)
