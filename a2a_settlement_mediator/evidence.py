@@ -205,6 +205,12 @@ def _fetch_structured_evidence(
     try:
         data = client.list_evidence(escrow_id=escrow_id)
         for item in data.get("evidence", []):
+            # Carried so the record matches the exchange's. The mediator has no
+            # keys and never decrypts; a non-string value is dropped rather
+            # than failing validation and losing every submission.
+            key_id = item.get("encryption_key_id")
+            if not isinstance(key_id, str):
+                key_id = None
             se = StructuredEvidence(
                 id=item["id"],
                 submitter_id=item["submitter_id"],
@@ -212,6 +218,7 @@ def _fetch_structured_evidence(
                 summary=item.get("summary", ""),
                 artifacts=item.get("artifacts", []),
                 encrypted=item.get("encrypted", False),
+                encryption_key_id=key_id,
                 content_hash=item.get("content_hash", ""),
                 attestor_id=item.get("attestor_id"),
                 attestor_signature=item.get("attestor_signature"),
