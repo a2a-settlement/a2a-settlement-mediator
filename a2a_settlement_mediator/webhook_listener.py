@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import AsyncIterator
@@ -45,11 +46,10 @@ from a2a_settlement_mediator.patch_assessor import assess_patch
 from a2a_settlement_mediator.schemas import AuditRecord, VerifyPatchRequest, WebhookPayload
 from a2a_settlement_mediator import storage
 from a2a_settlement_mediator.settlement_pipeline import (
-    get_confirmed_settlement,
-    get_merkle_tree,
-    get_pending_settlements,
-    mark_executed,
-    mark_failed,
+    detach_ledger,
+    ledger_problems,
+    merkle_status as _merkle_status,
+    restore_ledger,
     settle,
 )
 from a2a_settlement_mediator.worm_schemas import (
@@ -99,11 +99,35 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         getattr(settings, "tsa_fallback_url", ""),
     )
     storage.initialize_db()
+    # The database is the source of truth for the settlement Merkle tree and
+    # the recovery ledger. A tree that does not rebuild to its stored root is
+    # logged at ERROR and reported by GET /merkle; POST /settle is then refused.
+    restore_ledger()
+    _warn_if_multiple_workers()
     startup_receipts(settings)
     _log_auth_posture()
     _heartbeat.start()
     yield
     _heartbeat.stop()
+    detach_ledger()
+
+
+def _warn_if_multiple_workers() -> None:
+    """Say what running more than one worker process means for settlements."""
+    raw = os.getenv("WEB_CONCURRENCY", "").strip()
+    try:
+        workers = int(raw) if raw else 1
+    except ValueError:
+        return
+    if workers > 1:
+        logger.warning(
+            "WEB_CONCURRENCY=%d: every worker must use the same MEDIATOR_DB_PATH on a local "
+            "filesystem. Merkle appends and settlement acknowledgements are serialized "
+            "through that database and stay correct. Each worker runs its own heartbeat, "
+            "so a stale settlement can be posted to MEDIATOR_EXECUTION_CALLBACK_URL once "
+            "per worker; the receiver must treat settlement_hash as an idempotency key.",
+            workers,
+        )
 
 
 app = FastAPI(
@@ -707,6 +731,17 @@ def trigger_settlement(req: SettlementRequest):
         else None
     )
 
+    # Refuse before spending an LLM call and a timestamp on a settlement that
+    # could not be appended anyway.
+    if ledger_problems():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The stored Merkle tree is inconsistent; no settlement is accepted until "
+                "it is resolved. See GET /merkle."
+            ),
+        )
+
     result = settle(
         transcript,
         mandates,
@@ -717,7 +752,9 @@ def trigger_settlement(req: SettlementRequest):
     # A settlement is stored under the hash in its proof. A result with no
     # proof (rejected by arbitration, or aborted at a later stage) was never
     # timestamped or added to the Merkle tree, so it has no hash to key on and
-    # is returned to the caller without being stored.
+    # is returned to the caller without being stored. Once the ledger has been
+    # restored at startup the pipeline has already stored the result, together
+    # with its leaf, and this call changes nothing.
     if result.proof is not None:
         storage.save_settlement_result(result.proof.settlement_hash, result.model_dump_json())
 
@@ -733,12 +770,14 @@ def list_settlements(limit: int = 20, offset: int = 0):
 
 @operator_router.get("/merkle")
 def merkle_status():
-    """Return current Merkle Tree state."""
-    tree = get_merkle_tree()
-    return {
-        "tree_size": tree.size,
-        "root_hash": tree.root_hash.hex() if tree.size > 0 else None,
-    }
+    """Return current Merkle Tree state.
+
+    ``tree_size`` and ``root_hash`` are as before. ``consistent`` is false,
+    and ``problems`` says why, when the stored leaves do not rebuild to the
+    stored root. ``legacy`` reports the one-time import of results stored by
+    releases that kept the tree in memory.
+    """
+    return _merkle_status()
 
 
 # ---------------------------------------------------------------------------
@@ -753,11 +792,8 @@ def list_pending_settlements():
     The Gatekeeper's recovery loop should poll this endpoint and re-emit
     the AP2 Mandate for each result.
     """
-    pending = get_pending_settlements()
-    return {
-        "pending": [r.model_dump(mode="json") for r in pending],
-        "count": len(pending),
-    }
+    pending = storage.list_pending_settlement_results()
+    return {"pending": pending, "count": len(pending)}
 
 
 class ExecutionAck(BaseModel):
@@ -775,20 +811,29 @@ def ack_execution(ack: ExecutionAck):
     Called by the execution engine after the AP2 Mandate has been
     released.  This closes the Gatekeeper's recovery window for the
     given settlement.
+
+    The stored settlement is the source of truth, so this works for any
+    stored settlement, including one made before a restart. The first
+    acknowledgement wins: repeating it returns 200 and changes nothing, and
+    the opposite one is refused with 409.
     """
-    if ack.status == "executed":
-        found = mark_executed(ack.settlement_hash)
-        if found:
-            storage.mark_settlement_executed(ack.settlement_hash)
-    elif ack.status == "failed":
-        found = mark_failed(ack.settlement_hash, ack.error or "unknown error")
-        if found:
-            storage.mark_settlement_failed(ack.settlement_hash, ack.error or "unknown error")
-    else:
+    if ack.status not in (storage.STATUS_EXECUTED, storage.STATUS_FAILED):
         raise HTTPException(status_code=400, detail=f"Invalid status: {ack.status!r}")
 
-    if not found:
+    error = (ack.error or "unknown error") if ack.status == storage.STATUS_FAILED else None
+    outcome, stored_status = storage.acknowledge_settlement(
+        ack.settlement_hash, ack.status, error
+    )
+    if outcome == storage.ACK_NOT_FOUND:
         raise HTTPException(status_code=404, detail="Settlement not found")
+    if outcome == storage.ACK_CONFLICT:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Settlement is already acknowledged as {stored_status}; "
+                f"it cannot be changed to {ack.status}"
+            ),
+        )
 
     return {"settlement_hash": ack.settlement_hash, "status": ack.status}
 

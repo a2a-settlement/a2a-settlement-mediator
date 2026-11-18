@@ -146,7 +146,7 @@ client.set_webhook(
 |---|---|---|
 | `POST` | `/settle` | Run the full settlement pipeline (arbitration → timestamp → Merkle → proof) |
 | `GET` | `/settlements` | List recent settlement results |
-| `GET` | `/merkle` | Current Merkle Tree state (size + root hash) |
+| `GET` | `/merkle` | Current Merkle Tree state (size + root hash, and whether the stored tree is consistent) |
 | `GET` | `/settlements/pending` | Confirmed settlements awaiting mandate execution (recovery) |
 | `POST` | `/settlements/ack` | Acknowledge mandate execution (mark executed/failed) |
 | `GET` | `/schemas` | Versioned JSON Schema definitions for all attestation models |
@@ -251,6 +251,7 @@ The Scribe uses a **SHA-256 binary Merkle Tree** with domain-separated hashing (
 - **Tree structure:** Unbalanced binary tree (RFC 6962 §2.1 style). When the leaf count is not a power of two, the last leaf at each level is promoted without a sibling. The shape is fully deterministic given the leaf count.
 - **Append-only:** Leaves are never removed or mutated (WORM semantics).
 - **Thread-safe:** All mutations serialized via lock.
+- **Stored:** Each leaf is written to the mediator's SQLite database as it is appended. At startup the tree is rebuilt from the stored leaves and its root is checked against the stored root, so the tree continues across restarts. If the check fails the mediator does not start a new tree: `GET /merkle` reports `consistent: false` and `POST /settle` returns 503. See [SECURITY.md](SECURITY.md) (Layer 4) for what this covers, including settlements stored by earlier releases.
 
 Third-party verification requires only the leaf data, sibling path, and the root hash at insertion time — no tree access needed.
 
@@ -258,9 +259,11 @@ Third-party verification requires only the leaf data, sibling path, and the root
 
 If the Merkle append succeeds but the network fails before the mandate is released to the execution engine:
 
-1. The pipeline records every confirmed settlement in a recovery ledger (`GET /settlements/pending`)
+1. The pipeline stores every confirmed settlement in the SQLite database, which is the recovery ledger (`GET /settlements/pending`). It survives a restart.
 2. The execution engine polls for pending mandates and re-emits them
 3. After successful execution, it acknowledges via `POST /settlements/ack`
+
+An acknowledgement works for any stored settlement and shows up in `GET /settlements` as `execution_status`. The first acknowledgement wins: repeating it returns 200, and the opposite one (`failed` after `executed`, or the reverse) returns 409.
 
 This prevents "Phantom Settlements" where a payment occurs without an audit trail, and also prevents the inverse — a confirmed audit leaf with no corresponding execution.
 
@@ -303,7 +306,8 @@ a2a_settlement_mediator/
 
 ## Roadmap
 
-- [ ] Persistent audit + Merkle storage (SQLite/Postgres backing for WORM tree and recovery ledger)
+- [x] Persistent audit + Merkle storage (SQLite backing for WORM tree and recovery ledger)
+- [ ] Anchor the Merkle root outside the mediator's database
 - [ ] Artifact content inspection (fetch and verify deliverable content)
 - [ ] Multi-LLM consensus (2-of-3 agreement for high-value disputes)
 - [ ] **Multi-Sig / Consensus Mediator** — Support multiple auditors that must agree before the Gatekeeper releases a mandate (threshold signatures or BFT consensus)

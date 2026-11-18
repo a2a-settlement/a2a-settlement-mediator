@@ -87,6 +87,18 @@ class MerkleTree:
             self._leaves.append(leaf_hash)
             return idx, leaf_hash
 
+    def append_leaf_hash(self, leaf_hash: bytes) -> int:
+        """Append an already computed leaf hash and return its index.
+
+        Used to rebuild a tree from stored leaf hashes, in insertion order.
+        The hash is taken as given; nothing is prefixed or rehashed.
+        """
+        if len(leaf_hash) != hashlib.sha256().digest_size:
+            raise ValueError(f"leaf hash must be 32 bytes, got {len(leaf_hash)}")
+        with self._lock:
+            self._leaves.append(leaf_hash)
+            return len(self._leaves) - 1
+
     def get_proof(self, leaf_index: int) -> tuple[list[bytes], list[str]]:
         """Generate a Merkle inclusion proof for the leaf at *leaf_index*.
 
