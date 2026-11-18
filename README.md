@@ -95,7 +95,9 @@ All settings via environment variables (see `.env.example`):
 | `MEDIATOR_LLM_TEMPERATURE` | `none` | `none` sends no temperature (Claude 5.x models reject one). Set a number, e.g. `0.1`, for a model that accepts it |
 | `MEDIATOR_AUTO_RESOLVE_THRESHOLD` | `0.80` | Confidence threshold for auto-resolution |
 | `MEDIATOR_PORT` | `3100` | Webhook listener port |
-| `MEDIATOR_WEBHOOK_SECRET` | — | HMAC secret for verifying exchange webhooks |
+| `MEDIATOR_WEBHOOK_SECRET` | — | HMAC secret for exchange webhooks and for signed calls to the operator routes. Required: with it empty those routes answer 503 |
+| `MEDIATOR_SIGNATURE_TOLERANCE_S` | `300` | Seconds a signed request's timestamp may differ from the mediator's clock |
+| `MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED` | `false` | Local development only. With no secret set, lets `/webhook` and the operator routes accept unsigned requests. Ignored when a secret is set |
 | `MEDIATOR_ESCALATION_WEBHOOK_URL` | — | Slack/webhook URL for escalation notices |
 | `MEDIATOR_TSA_URL` | `http://freetsa.org/tsr` | RFC 3161 Time Stamp Authority URL |
 | `MEDIATOR_TSA_TIMEOUT` | `15` | Seconds before TSA hard-fail |
@@ -121,13 +123,15 @@ client.set_webhook(
 
 ## API Endpoints
 
+`/health`, `/guide` and `/schemas` are public. `/webhook` requires the exchange's webhook signature. Every other route below requires an operator signature; see [Authenticating operator calls](#authenticating-operator-calls).
+
 ### Mediation
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Health check with config summary |
 | `POST` | `/webhook` | Receive exchange webhook events |
-| `POST` | `/mediate/{escrow_id}` | Manually trigger mediation (sync) |
+| `POST` | `/mediate/{escrow_id}` | Manually trigger mediation (sync). Executes the resolution on the exchange when confidence meets the threshold |
 | `GET` | `/audits` | List mediation audit records |
 | `GET` | `/audits/{escrow_id}` | Get audit record for a specific escrow |
 
@@ -141,6 +145,40 @@ client.set_webhook(
 | `GET` | `/settlements/pending` | Confirmed settlements awaiting mandate execution (recovery) |
 | `POST` | `/settlements/ack` | Acknowledge mandate execution (mark executed/failed) |
 | `GET` | `/schemas` | Versioned JSON Schema definitions for all attestation models |
+| `GET` | `/heartbeat/status` | State of the heartbeat recovery worker |
+
+### Authenticating operator calls
+
+`/mediate`, `/audits`, `/settle`, `/settlements`, `/settlements/pending`, `/settlements/ack`, `/merkle` and `/heartbeat/status` require three headers:
+
+| Header | Value |
+|---|---|
+| `X-A2ASE-Timestamp` | Unix seconds, within `MEDIATOR_SIGNATURE_TOLERANCE_S` of the mediator's clock |
+| `X-A2ASE-Nonce` | 16-128 characters from `A-Z a-z 0-9 _ -`, new for every request |
+| `X-A2ASE-Signature` | `v2=` + hex HMAC-SHA256, keyed with `MEDIATOR_WEBHOOK_SECRET` |
+
+The signed message is `v2`, the timestamp, the nonce, the upper-case method and the request target, each followed by a newline, then the raw body. The target is the path as sent (percent-encoded) plus `?query` when there is a query string.
+
+```python
+import hashlib, hmac, secrets, time
+import httpx
+
+def signed_headers(secret: str, method: str, target: str, body: bytes = b"") -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    message = f"v2\n{timestamp}\n{nonce}\n{method.upper()}\n{target}\n".encode() + body
+    digest = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    return {
+        "X-A2ASE-Timestamp": timestamp,
+        "X-A2ASE-Nonce": nonce,
+        "X-A2ASE-Signature": f"v2={digest}",
+    }
+
+target = "/audits?limit=5"
+resp = httpx.get(f"http://127.0.0.1:3100{target}", headers=signed_headers(SECRET, "GET", target))
+```
+
+Responses: 401 for a missing, malformed, stale or wrong signature, 409 when a signature is presented a second time, 503 when the mediator has no `MEDIATOR_WEBHOOK_SECRET`. Sign each attempt afresh; a retry that reuses the headers is rejected as a replay.
 
 ## Decision Framework
 

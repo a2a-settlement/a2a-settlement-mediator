@@ -51,8 +51,13 @@ _LARGE_DELIVERABLE = json.dumps(
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     from a2a_settlement_mediator import storage
+    # These tests exercise route behaviour, not authentication, so they run
+    # with no secret and the development opt-out on. tests/test_operator_route_auth.py
+    # covers the signature checks.
+    monkeypatch.setattr(settings, "webhook_secret", "")
+    monkeypatch.setattr(settings, "allow_unauthenticated", True)
     storage.initialize_db()
     return TestClient(app)
 
