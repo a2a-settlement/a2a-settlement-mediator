@@ -124,6 +124,7 @@ def collect_evidence(escrow_id: str) -> EvidenceBundle:
         fee_amount=escrow_data["fee_amount"],
         status=escrow_data["status"],
         dispute_reason=escrow_data.get("dispute_reason"),
+        dispute_filed_by=escrow_data.get("dispute_filed_by"),
         task_id=escrow_data.get("task_id"),
         task_type=escrow_data.get("task_type"),
         deliverables=deliverables,

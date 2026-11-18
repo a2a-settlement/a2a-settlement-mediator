@@ -46,6 +46,9 @@ class EscrowEvidence(BaseModel):
     fee_amount: int
     status: str
     dispute_reason: str | None = None
+    # Account that filed the dispute and put up the stake. Decides whether the
+    # stake is returned or forfeited; deliberately not shown to the LLM.
+    dispute_filed_by: str | None = None
     task_id: str | None = None
     task_type: str | None = None
     deliverables: list[Deliverable] = []
