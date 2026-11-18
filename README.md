@@ -91,7 +91,8 @@ All settings via environment variables (see `.env.example`):
 |---|---|---|
 | `A2A_EXCHANGE_URL` | `http://127.0.0.1:3000/v1` | Exchange API base URL (include `/v1` — mediator uses direct HTTP calls) |
 | `A2A_OPERATOR_API_KEY` | — | Operator-level API key for resolving disputes |
-| `MEDIATOR_LLM_MODEL` | `anthropic/claude-sonnet-4-20250514` | LiteLLM model string |
+| `MEDIATOR_LLM_MODEL` | `anthropic/claude-sonnet-5-5` | LiteLLM model string |
+| `MEDIATOR_LLM_TEMPERATURE` | `none` | `none` sends no temperature (Claude 5.x models reject one). Set a number, e.g. `0.1`, for a model that accepts it |
 | `MEDIATOR_AUTO_RESOLVE_THRESHOLD` | `0.80` | Confidence threshold for auto-resolution |
 | `MEDIATOR_PORT` | `3100` | Webhook listener port |
 | `MEDIATOR_WEBHOOK_SECRET` | — | HMAC secret for verifying exchange webhooks |

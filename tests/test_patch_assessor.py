@@ -474,3 +474,78 @@ def test_temperature_setting_accepts_none(monkeypatch, raw, expected):
 
     monkeypatch.setenv("MEDIATOR_LLM_TEMPERATURE", raw)
     assert _get_optional_float("MEDIATOR_LLM_TEMPERATURE", 0.1) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [(None, None), ("", None), ("none", None), ("0.1", 0.1), ("0", 0.0)]
+)
+def test_temperature_setting_with_no_default(monkeypatch, raw, expected):
+    from a2a_settlement_mediator.config import _get_optional_float
+
+    if raw is None:
+        monkeypatch.delenv("MEDIATOR_LLM_TEMPERATURE", raising=False)
+    else:
+        monkeypatch.setenv("MEDIATOR_LLM_TEMPERATURE", raw)
+    assert _get_optional_float("MEDIATOR_LLM_TEMPERATURE", None) == expected
+
+
+def _llm_settings_in_child(env_overrides: dict[str, str]) -> dict:
+    """Import the settings in a fresh interpreter with only these LLM variables set."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = str(Path(__file__).resolve().parent.parent)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MEDIATOR_LLM_")}
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (root, env.get("PYTHONPATH", "")) if p)
+    env.update(env_overrides)
+    script = (
+        "import json\n"
+        "from a2a_settlement_mediator.config import settings, temperature_kwargs\n"
+        "print(json.dumps({'model': settings.llm_model, 'sonnet': settings.llm_model_sonnet,"
+        " 'temperature': settings.llm_temperature, 'kwargs': temperature_kwargs()}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_llm_defaults_send_no_temperature():
+    assert _llm_settings_in_child({}) == {
+        "model": "anthropic/claude-sonnet-5-5",
+        "sonnet": "anthropic/claude-sonnet-5-5",
+        "temperature": None,
+        "kwargs": {},
+    }
+
+
+def test_explicit_llm_settings_are_kept():
+    explicit = {
+        "MEDIATOR_LLM_MODEL": "openai/gpt-4o",
+        "MEDIATOR_LLM_MODEL_SONNET": "anthropic/claude-sonnet-4-20250514",
+        "MEDIATOR_LLM_TEMPERATURE": "0.1",
+    }
+    assert _llm_settings_in_child(explicit) == {
+        "model": "openai/gpt-4o",
+        "sonnet": "anthropic/claude-sonnet-4-20250514",
+        "temperature": 0.1,
+        "kwargs": {"temperature": 0.1},
+    }
+
+
+def test_mediator_context_records_no_temperature(monkeypatch):
+    from a2a_settlement_mediator.mediator import _build_mediator_context
+
+    monkeypatch.setattr(settings, "llm_temperature", None)
+    context = _build_mediator_context()
+    assert context.temperature is None
+    assert context.model_dump()["temperature"] is None

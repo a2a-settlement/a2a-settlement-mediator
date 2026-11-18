@@ -25,7 +25,7 @@ def _get_float(name: str, default: float) -> float:
     return float(val)
 
 
-def _get_optional_float(name: str, default: float) -> float | None:
+def _get_optional_float(name: str, default: float | None) -> float | None:
     """Like _get_float, but "none" means the setting is not sent at all."""
     val = os.getenv(name)
     if val is None or val == "":
@@ -75,12 +75,11 @@ class MediatorSettings:
     operator_api_key: str = os.getenv("A2A_OPERATOR_API_KEY", "")
 
     # --- LLM provider (via LiteLLM) ---
-    llm_model: str = os.getenv("MEDIATOR_LLM_MODEL", "anthropic/claude-sonnet-4-20250514")
-    llm_model_sonnet: str = os.getenv(
-        "MEDIATOR_LLM_MODEL_SONNET", "anthropic/claude-sonnet-4-20250514"
-    )
-    # Set to "none" for models that reject a temperature (Claude 5.x).
-    llm_temperature: float | None = _get_optional_float("MEDIATOR_LLM_TEMPERATURE", 0.1)
+    llm_model: str = os.getenv("MEDIATOR_LLM_MODEL", "anthropic/claude-sonnet-5-5")
+    llm_model_sonnet: str = os.getenv("MEDIATOR_LLM_MODEL_SONNET", "anthropic/claude-sonnet-5-5")
+    # Unset or "none" sends no temperature: the default model (Claude 5.x) rejects
+    # one. Set a number (e.g. 0.1) for models that accept it.
+    llm_temperature: float | None = _get_optional_float("MEDIATOR_LLM_TEMPERATURE", None)
     llm_max_tokens: int = _get_int("MEDIATOR_LLM_MAX_TOKENS", 4096)
 
     # --- Anti-self-dealing ---
