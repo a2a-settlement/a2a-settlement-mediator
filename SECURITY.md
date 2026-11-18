@@ -123,7 +123,7 @@ To rotate one purpose's secret later, there is no second slot: the mediator and 
 - *Deliverable structure.* An empty deliverable, a deliverable that looks like JSON but does not parse, or JSON missing fields that the acceptance criteria name is refunded automatically at confidence 0.95 with no LLM call.
 - *Self-dealing classification.* The exchange classifies each escrow when it is created and stores `arms_length`, `suspected_self_dealing` or `self_dealing` in the escrow's `self_dealing_class` column. Evidence collection reads the top-level `self_dealing_class` field of the escrow record returned by the exchange and nothing else: the dispute reason, deliverables, provenance and submitted evidence are not consulted for it. When the value is `self_dealing`, the mediator refunds the escrow to the requester with no LLM call, whatever the amount, sends no stake ruling (the exchange then returns a held dispute stake to the filer) and adds a `null_resolution` entry to the compliance queue. A missing field, `null` or any value other than those three is treated as unclassified and the dispute goes through the normal pipeline. The check therefore depends on the exchange including the field in its escrow detail response. The `EscrowDetailResponse` schema in [a2a-settlement](https://github.com/a2a-settlement/a2a-settlement) does not include it at the time of writing, so against that exchange the mediator sees every escrow as unclassified and this branch does not run.
 - *Verification artifacts.* When a deliverable carries a `verification_artifacts` block, the mediator recomputes SHA-256 of the raw API response and compares it with the claimed `content_hash`. Both values come from the provider, so a match shows internal consistency only, and the prompt says so.
-- *Provenance.* When the escrow carries provenance data, the provenance verifier runs and its result is given to the LLM as one factor.
+- *Provenance.* When the escrow carries provenance data, the provenance verifier runs and its result is given to the LLM as one factor. Its network requests are described under [Outbound Requests](#outbound-requests).
 
 The mediator does not compare delivered content against the `artifact_hash` values recorded on the escrow; those hashes are passed to the LLM as part of the evidence.
 
@@ -177,6 +177,37 @@ These controls apply to `POST /settle`, which is a separate pipeline from disput
 **Audit Record Access.** `GET /audits` and `GET /audits/{escrow_id}` return stored audit records, which contain the collected evidence (including delivered content), the verdict and the exchange's response. Both require the operator signature.
 
 **Logging.** With `MEDIATOR_AUDIT_LOG=true` (the default) the raw LLM response and the full audit record are written to the process log. Treat the log as containing the same data as the audit records.
+
+## Outbound Requests
+
+The mediator makes two kinds of outbound request, and treats them differently.
+
+**Operator-configured endpoints.** These URLs come only from the mediator's environment and are requested as configured, with no address filtering. They may legitimately be loopback or private addresses (the default exchange URL is `http://127.0.0.1:3000/v1`):
+
+| Endpoint | Setting |
+|---|---|
+| Exchange API (evidence collection, resolution) | `A2A_EXCHANGE_URL` |
+| LLM provider | `MEDIATOR_LLM_MODEL`, `MEDIATOR_LLM_MODEL_SONNET` and the provider settings LiteLLM reads from the environment |
+| Time Stamp Authority | `MEDIATOR_TSA_URL`, `MEDIATOR_TSA_FALLBACK_URL` |
+| Escalation notice | `MEDIATOR_ESCALATION_WEBHOOK_URL` |
+| Settlement execution callback (heartbeat worker) | `MEDIATOR_EXECUTION_CALLBACK_URL` |
+
+No request body, webhook payload or exchange record can change the host these requests go to. Escrow and account IDs are placed in the path of exchange API calls.
+
+**Provenance source references.** The `source_refs[].uri` values in an escrow's provenance are written by the provider when it delivers. The mediator requests them in two places: the tier 3 (`verifiable`) check, which also applies to any escrow with provenance at or above `MEDIATOR_PROVENANCE_VERIFIABLE_THRESHOLD`, and the tier 2 (`signed`) spot check. Both go through one guard (`a2a_settlement_mediator/outbound.py`):
+
+- Only `http` and `https` URLs are requested, and only with `GET` or `HEAD`. A reference that names another method is not requested.
+- The host name is resolved once. If any resolved address, IPv4 or IPv6, is loopback, private, link-local, carrier-grade NAT, multicast, unspecified, reserved, documentation space, or an IPv6 form that embeds an IPv4 address (IPv4-mapped, NAT64, 6to4, Teredo), the request is not sent.
+- The connection is made to an address that passed that check; the name is not resolved again. For HTTPS, the certificate is still verified against the host name in the URL.
+- Redirects are not followed by the HTTP client. Each `Location` goes through the same checks before it is requested, up to 3 hops.
+- Each request has a 10 second timeout per network operation (5 seconds for the spot check) and an overall deadline of three times that. A response body is read only when there is a `content_hash` to compare, and at most 5 MiB of it.
+- Proxy settings in the environment (`HTTP_PROXY`, `HTTPS_PROXY`) are not used for these requests.
+
+A refused reference is recorded with an `endpoint_blocked:` flag, and the provenance result is not verified. Ports are not restricted, and any public address is allowed, so a provenance URI can still make the mediator send a `GET` or `HEAD` to an arbitrary public host. The mediator returns no response body from these requests; the provenance result carries the outcome flags, including the HTTP status of a failed fetch, and those flags are given to the LLM and sent to the exchange with the resolution. The number of source references in one provenance record is not capped by the mediator.
+
+`MEDIATOR_INSECURE_ALLOW_PRIVATE_FETCH_ADDRESSES=true` (default off) lifts the address check, for local development and tests where the source is on the same machine. The scheme, method, redirect and size rules still apply. The mediator logs a warning beginning `INSECURE` at startup and on each such fetch while it is on. Do not set it on a host that runs other services.
+
+The guard filters by address. It is not a substitute for network-level egress controls, and it does not protect a service on a public address that trusts requests because they come from the mediator's IP.
 
 ## Assumptions about the exchange
 

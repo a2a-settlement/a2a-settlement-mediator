@@ -160,6 +160,12 @@ class MediatorSettings:
         "MEDIATOR_PROVENANCE_VERIFIABLE_THRESHOLD",
         1000,
     )
+    # Local development and tests only. Provenance URLs are written by escrow
+    # parties; by default the mediator refuses to fetch any that resolve to a
+    # loopback, private, link-local or otherwise non-public address.
+    allow_private_fetch_addresses: bool = _get_bool(
+        "MEDIATOR_INSECURE_ALLOW_PRIVATE_FETCH_ADDRESSES", False
+    )
 
     # --- Deliverable size routing ---
     # Token budget for the full evidence bundle sent to the LLM.

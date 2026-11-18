@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import socket
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -65,6 +66,15 @@ def endpoint_status(monkeypatch):
             return real_client(*args, **kwargs)
 
         monkeypatch.setattr(provenance_module.httpx, "AsyncClient", client)
+        # The fetch guard resolves the host before connecting; answer with a
+        # public address instead of querying DNS.
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda host, port, *args, **kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+            ],
+        )
 
     return install
 
