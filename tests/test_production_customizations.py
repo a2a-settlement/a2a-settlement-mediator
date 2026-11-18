@@ -1,4 +1,4 @@
-"""Behaviour that ran only on the production droplet before it was committed.
+"""Behaviour that ran only on the production server before it was committed.
 
 Caddy routes ``/mediator/guide`` to ``GET /guide``, so the guide must keep serving.
 """
