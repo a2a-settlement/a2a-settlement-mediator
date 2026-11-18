@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from a2a_settlement_mediator import evidence as evidence_module
+from a2a_settlement_mediator import storage
 from a2a_settlement_mediator.config import settings
 from a2a_settlement_mediator.mediator import mediate
 from a2a_settlement_mediator.schemas import (
@@ -169,6 +170,12 @@ def _prompt_text(mock_completion: MagicMock) -> str:
     mock_completion.assert_called_once()
     messages = mock_completion.call_args.kwargs["messages"]
     return "\n".join(m["content"] for m in messages)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "DB_PATH", str(tmp_path / "mediator.db"))
+    storage.initialize_db()
 
 
 @pytest.fixture(autouse=True)
