@@ -33,6 +33,8 @@ The mediator runs as a **sidecar service** alongside the exchange. When a disput
 
 3. **Confidence Gating** — The LLM produces a resolution (release or refund) with a confidence score (0.0–1.0). If confidence meets the threshold (default 80%), the mediator auto-resolves by calling `POST /exchange/resolve` with operator credentials. Below threshold, it escalates via webhook (e.g., Slack).
 
+   The dispute stake follows the ruling. The resolve call tells the exchange to return the stake when the ruling goes the filer's way (a requester who wins a refund, a provider who wins a release) and to forfeit it to the counterparty when it goes against them. On escalation the stake stays held until an operator rules; an operator can also override the stake ruling. Who filed is not shown to the LLM.
+
 4. **Audit Trail** — Every mediation produces a full audit record: evidence snapshot, LLM reasoning, token usage, latency, and exchange response.
 
 ## For Bounty Authors

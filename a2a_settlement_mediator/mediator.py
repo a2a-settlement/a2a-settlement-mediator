@@ -430,6 +430,24 @@ def _build_verdict(escrow_id: str, llm_output: dict) -> Verdict:
 # ---------------------------------------------------------------------------
 
 
+def _stake_ruling(escrow, resolution: Resolution) -> str | None:
+    """Decide the dispute stake from who filed and which way the ruling went.
+
+    The filer keeps the stake when the ruling goes their way (a requester who
+    wins a refund, a provider who wins a release) and forfeits it to the
+    counterparty when it goes against them. When the filer is unknown or is
+    not a party, no ruling is sent and the exchange returns the stake.
+    """
+    filer = escrow.dispute_filed_by
+    if filer == escrow.requester_id:
+        wanted = Resolution.REFUND
+    elif filer == escrow.provider_id:
+        wanted = Resolution.RELEASE
+    else:
+        return None
+    return "return" if resolution == wanted else "forfeit"
+
+
 def _execute_resolution(
     escrow_id: str,
     resolution: Resolution,
@@ -706,7 +724,10 @@ def mediate(
             from a2a_settlement_mediator.storage import add_compliance_queue_entry
             add_compliance_queue_entry(escrow_id, "suspected_self_dealing_review_required")
 
-    evidence_json = evidence.model_dump_json(indent=2)
+    # Who filed decides the stake, not the merits, so the LLM is not told.
+    evidence_json = evidence.model_dump_json(
+        indent=2, exclude={"escrow": {"dispute_filed_by"}}
+    )
 
     # 2. Verify provenance
     provenance_result = _run_provenance_verification(evidence)
@@ -775,7 +796,7 @@ def mediate(
                 Resolution.REFUND,
                 provenance_result_dict,
                 mediator_context=mediator_ctx_dict,
-                stake_ruling="forfeit",
+                stake_ruling=_stake_ruling(evidence.escrow, Resolution.REFUND),
             )
             logger.info(
                 "Structural integrity failure auto-refunded escrow %s (%s)",
@@ -965,9 +986,7 @@ def mediate(
 
     if verdict.outcome in (VerdictOutcome.AUTO_RELEASE, VerdictOutcome.AUTO_REFUND):
         assert verdict.resolution is not None
-        stake_ruling = (
-            "return" if verdict.confidence >= settings.auto_resolve_threshold else "forfeit"
-        )
+        stake_ruling = _stake_ruling(evidence.escrow, verdict.resolution)
         try:
             exchange_response = _execute_resolution(
                 escrow_id,
