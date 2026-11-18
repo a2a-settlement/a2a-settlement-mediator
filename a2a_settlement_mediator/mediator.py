@@ -51,13 +51,25 @@ logger = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
 
-def _build_mediator_context() -> MediatorContext:
-    """Capture the mediator's configuration for determinism auditing."""
+# Recorded as the model when a path decides a dispute without calling an LLM.
+NO_LLM_MODEL = "none"
+
+
+def _build_mediator_context(
+    model: str | None = None,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> MediatorContext:
+    """Capture the mediator's configuration for determinism auditing.
+
+    ``model`` is the model the dispute is sent to, or ``NO_LLM_MODEL`` on a
+    path that calls no LLM; it defaults to the configured default model.
+    ``system_prompt`` is the system prompt that goes with it.
+    """
     import hashlib as _hl
 
-    prompt_hash = _hl.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    prompt_hash = _hl.sha256(system_prompt.encode("utf-8")).hexdigest()
     return MediatorContext(
-        model_version=settings.llm_model,
+        model_version=model or settings.llm_model,
         system_prompt_hash=prompt_hash,
         temperature=settings.llm_temperature,
         max_tokens=settings.llm_max_tokens,
@@ -289,6 +301,7 @@ def _call_llm_digest(
     mode: str | None = None,
     task_type: str | None = None,
     hash_verification_result: dict | None = None,
+    model_override: str | None = None,
 ) -> tuple[dict, int, int, int]:
     """Send a deliverable digest to the LLM for evaluation.
 
@@ -314,7 +327,7 @@ def _call_llm_digest(
 
     t0 = time.monotonic()
     response = litellm.completion(
-        model=settings.llm_model,
+        model=model_override or settings.llm_model,
         messages=[
             {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -440,7 +453,6 @@ def _execute_resolution(
 def _null_resolution(
     escrow_id: str,
     evidence,
-    mediator_ctx: MediatorContext,
 ) -> AuditRecord:
     """Return funds to requester without LLM arbitration for confirmed self-dealing.
 
@@ -449,6 +461,9 @@ def _null_resolution(
     through ``mediate``, the audit record is returned for the caller to store.
     """
     from a2a_settlement_mediator.storage import add_compliance_queue_entry
+
+    # No LLM is called on this path, so no model is recorded.
+    mediator_ctx = _build_mediator_context(model=NO_LLM_MODEL)
 
     logger.warning(
         "Null-resolving self-dealing dispute for escrow %s — refunding requester without LLM",
@@ -488,10 +503,10 @@ def _null_resolution(
         evidence=evidence,
         verdict=verdict,
         mediator_context=mediator_ctx,
-        llm_model="none",
+        llm_model=NO_LLM_MODEL,
         exchange_response=exchange_response,
         error=error,
-        evaluation_method="structural_error",
+        evaluation_method="null_resolution",
     )
     return audit
 
@@ -664,9 +679,6 @@ def mediate(
     """
     logger.info("Starting mediation for escrow %s", escrow_id)
 
-    # 0. Build mediator context for determinism auditing
-    mediator_ctx = _build_mediator_context()
-
     # 1. Collect evidence (including structured submissions from both parties)
     evidence = collect_evidence(escrow_id)
 
@@ -679,7 +691,7 @@ def mediate(
     # Suspected self-dealing → escalate to Sonnet tier; flag for human review if large.
     sdc = evidence.escrow.self_dealing_class
     if sdc == "self_dealing":
-        return _null_resolution(escrow_id, evidence, mediator_ctx)
+        return _null_resolution(escrow_id, evidence)
 
     llm_model_override: str | None = None
     if sdc == "suspected_self_dealing":
@@ -741,13 +753,15 @@ def mediate(
             reasoning=reason,
             factors=[code],
         )
+        # No LLM is called on this path, so no model is recorded.
+        mediator_ctx = _build_mediator_context(model=NO_LLM_MODEL)
         structural_audit = AuditRecord(
             escrow_id=escrow_id,
             evidence=evidence,
             verdict=structural_verdict,
             provenance_result=provenance_result,
             mediator_context=mediator_ctx,
-            llm_model=settings.llm_model,
+            llm_model=NO_LLM_MODEL,
             evaluation_method="structural_error",
             deliverable_size_bytes=len(delivered_content.encode("utf-8")) if delivered_content else 0,
             created_at=datetime.now(timezone.utc),
@@ -800,6 +814,14 @@ def mediate(
     total_tokens = estimate_tokens(evidence_json)
     use_digest = total_tokens > settings.mediator_token_budget
 
+    # The model and system prompt this dispute is evaluated with. Decided once
+    # here and used for the call on either path and for every record of it.
+    selected_model = llm_model_override or settings.llm_model
+    mediator_ctx = _build_mediator_context(
+        model=selected_model,
+        system_prompt=DIGEST_SYSTEM_PROMPT if use_digest else SYSTEM_PROMPT,
+    )
+
     # 3. Evaluate via LLM
     exchange_response = None
     error = None
@@ -808,6 +830,7 @@ def mediate(
     latency_ms = 0
     evaluation_method = "direct"
     digest_size_tokens: int | None = None
+    llm_called = False
 
     if use_digest:
         logger.info(
@@ -830,6 +853,7 @@ def mediate(
             )
             evidence_context_json = _json_mod.dumps(evidence_dict, indent=2)
 
+            llm_called = True
             llm_output, prompt_tokens, completion_tokens, latency_ms = _call_llm_digest(
                 digest,
                 evidence_context_json,
@@ -842,6 +866,7 @@ def mediate(
                 mode=mode,
                 task_type=task_type,
                 hash_verification_result=hash_verification_result,
+                model_override=llm_model_override,
             )
             verdict = _build_verdict(escrow_id, llm_output)
             evaluation_method = "digest"
@@ -872,14 +897,20 @@ def mediate(
             )
             error = str(exc)
             evaluation_method = "system_error"
-            # Return early — do not call _execute_resolution, do not score agent
+            # Return early — do not call _execute_resolution, do not score agent.
+            # If the failure came before the LLM call (e.g. building the digest),
+            # no model was involved and none is recorded.
+            if not llm_called:
+                mediator_ctx = _build_mediator_context(
+                    model=NO_LLM_MODEL, system_prompt=DIGEST_SYSTEM_PROMPT
+                )
             system_error_audit = AuditRecord(
                 escrow_id=escrow_id,
                 evidence=evidence,
                 verdict=verdict,
                 provenance_result=provenance_result,
                 mediator_context=mediator_ctx,
-                llm_model=settings.llm_model,
+                llm_model=selected_model if llm_called else NO_LLM_MODEL,
                 error=error,
                 evaluation_method="system_error",
                 deliverable_size_bytes=deliverable_size_bytes,
@@ -971,7 +1002,7 @@ def mediate(
         verdict=verdict,
         provenance_result=provenance_result,
         mediator_context=mediator_ctx,
-        llm_model=settings.llm_model,
+        llm_model=selected_model,
         llm_prompt_tokens=prompt_tokens,
         llm_completion_tokens=completion_tokens,
         llm_latency_ms=latency_ms,

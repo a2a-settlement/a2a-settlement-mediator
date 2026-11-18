@@ -200,8 +200,12 @@ class AuditRecord(BaseModel):
     # How the deliverable was evaluated. "direct" = full content sent to LLM;
     # "digest" = oversized deliverable was summarised before LLM evaluation;
     # "structural_error" = pre-LLM integrity check failed (provider fault, scored);
-    # "system_error" = mediator processing failure (platform fault, not scored).
-    evaluation_method: Literal["direct", "digest", "structural_error", "system_error"] = "direct"
+    # "system_error" = mediator processing failure (platform fault, not scored);
+    # "null_resolution" = escrow classified self_dealing by the exchange, refunded
+    # without evaluating the deliverable (no LLM call, not scored).
+    evaluation_method: Literal[
+        "direct", "digest", "structural_error", "system_error", "null_resolution"
+    ] = "direct"
     deliverable_size_bytes: int | None = None
     digest_size_tokens: int | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
