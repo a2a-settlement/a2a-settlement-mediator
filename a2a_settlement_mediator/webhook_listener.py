@@ -2,6 +2,17 @@
 
 Receives escrow.disputed events and triggers the mediation pipeline.
 Verifies webhook signatures using HMAC-SHA256 (same scheme as the exchange).
+
+Every route except ``/health``, ``/guide``, ``/schemas`` and the public
+receipt lookups requires an HMAC keyed with ``MEDIATOR_WEBHOOK_SECRET``.
+Three message formats share that key:
+
+* ``/webhook``: ``sha256=`` HMAC over the raw body (the exchange's scheme).
+* ``/api/v1/verify-patch`` and ``POST /api/v1/receipts``: ``sha256=`` HMAC
+  over ``{timestamp}.{body}``, accepted once inside the timestamp window.
+* Operator routes (``/mediate``, ``/audits``, ``/settle``, ``/settlements``,
+  ``/merkle``, ``/heartbeat/status``): ``v2=`` HMAC that also covers a nonce,
+  the method and the request target. See ``operator_signature_message``.
 """
 
 from __future__ import annotations
@@ -10,6 +21,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -17,9 +29,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -85,6 +98,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     )
     storage.initialize_db()
     startup_receipts(settings)
+    _log_auth_posture()
     _heartbeat.start()
     yield
     _heartbeat.stop()
@@ -109,12 +123,57 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mediator")
 # ---------------------------------------------------------------------------
 
 
+UNAUTHENTICATED_OPT_OUT_ENV = "MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED"
+
+
+def _unauthenticated_allowed() -> bool:
+    """True only when no secret is configured and the development opt-out is on.
+
+    A configured secret always wins: the opt-out cannot switch verification off
+    on a deployment that has one.
+    """
+    return not settings.webhook_secret and settings.allow_unauthenticated
+
+
+def _log_auth_posture() -> None:
+    """Say at startup how /webhook and the operator routes are protected."""
+    if settings.webhook_secret:
+        if settings.allow_unauthenticated:
+            logger.warning(
+                "%s is set but ignored because MEDIATOR_WEBHOOK_SECRET is configured; "
+                "signatures are still required",
+                UNAUTHENTICATED_OPT_OUT_ENV,
+            )
+        return
+    if settings.allow_unauthenticated:
+        logger.warning(
+            "INSECURE: %s is on and MEDIATOR_WEBHOOK_SECRET is empty. /webhook and "
+            "the operator routes (/mediate, /audits, /settle, /settlements, /merkle, "
+            "/heartbeat/status) accept UNAUTHENTICATED requests. Anyone who can "
+            "reach this port can trigger mediation with the operator API key. "
+            "Never run a reachable deployment this way.",
+            UNAUTHENTICATED_OPT_OUT_ENV,
+        )
+        return
+    logger.warning(
+        "MEDIATOR_WEBHOOK_SECRET is empty: /webhook and the operator routes refuse "
+        "every request with 503 until it is set"
+    )
+
+
 def _verify_signature(body: bytes, signature: str | None) -> bool:
-    """Verify the webhook HMAC-SHA256 signature."""
+    """Verify the webhook HMAC-SHA256 signature.
+
+    With no secret this returns False unless the development opt-out is on.
+    """
     if not settings.webhook_secret:
-        # No secret configured — skip verification (development mode)
-        logger.warning("Webhook signature verification skipped (no secret configured)")
-        return True
+        if _unauthenticated_allowed():
+            logger.warning(
+                "Webhook signature verification skipped (%s is on)",
+                UNAUTHENTICATED_OPT_OUT_ENV,
+            )
+            return True
+        return False
 
     if not signature:
         return False
@@ -150,6 +209,123 @@ def _verify_patch_signature(
     if not hmac.compare_digest(f"sha256={expected}", signature):
         return None
     return expected
+
+
+# ---------------------------------------------------------------------------
+# Operator route authentication
+# ---------------------------------------------------------------------------
+
+OPERATOR_SIGNATURE_VERSION = "v2"
+_NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+
+
+def operator_signature_message(
+    timestamp: str, nonce: str, method: str, target: bytes, body: bytes
+) -> bytes:
+    """The exact bytes an operator-route signature covers.
+
+    ``v2``, the timestamp, the nonce, the upper-case method and the request
+    target, each followed by one ``\n``, then the raw body. The target is the
+    request path as sent on the wire (still percent-encoded), plus ``?`` and
+    the raw query string when there is one. None of the header fields can
+    contain a newline, so the encoding is unambiguous. The leading ``v2``
+    keeps these signatures disjoint from the ``{timestamp}.{body}`` form,
+    which always starts with a digit.
+    """
+    head = f"{OPERATOR_SIGNATURE_VERSION}\n{timestamp}\n{nonce}\n{method.upper()}\n"
+    return head.encode("ascii") + target + b"\n" + body
+
+
+def _request_target(request: Request) -> bytes:
+    raw_path = request.scope.get("raw_path")
+    if raw_path is None:
+        raw_path = request.scope["path"].encode("utf-8")
+    # Some servers put the query string in raw_path; the signed form adds it once.
+    raw_path = raw_path.split(b"?", 1)[0]
+    query = request.scope.get("query_string") or b""
+    return raw_path + b"?" + query if query else raw_path
+
+
+async def require_operator_signature(request: Request) -> None:
+    """Authenticate one operator-route request, or raise.
+
+    Headers: ``X-A2ASE-Timestamp`` (unix seconds), ``X-A2ASE-Nonce``
+    (16 to 128 characters of ``A-Z a-z 0-9 _ -``) and
+    ``X-A2ASE-Signature: v2=<hex HMAC-SHA256>`` over
+    ``operator_signature_message``. Refuses with 503 when no secret is
+    configured, 401 for a missing, malformed, stale or wrong signature, and
+    409 when a verified signature is presented a second time.
+    """
+    secret = settings.webhook_secret
+    if not secret:
+        if _unauthenticated_allowed():
+            return
+        raise HTTPException(
+            status_code=503,
+            detail="operator routes require MEDIATOR_WEBHOOK_SECRET",
+        )
+
+    timestamp = request.headers.get("x-a2ase-timestamp")
+    nonce = request.headers.get("x-a2ase-nonce")
+    signature = request.headers.get("x-a2ase-signature")
+    if (
+        not timestamp
+        or not timestamp.isascii()
+        or not timestamp.isdigit()
+        or len(timestamp) > 12
+        or not nonce
+        or not _NONCE_RE.fullmatch(nonce)
+        or not signature
+    ):
+        raise HTTPException(status_code=401, detail="Invalid operator signature")
+
+    now = _now()
+    stamp = int(timestamp)
+    tolerance = settings.signature_tolerance_seconds
+    if abs(now - stamp) > tolerance:
+        raise HTTPException(
+            status_code=401,
+            detail="Signature timestamp outside the allowed window",
+        )
+
+    body = await request.body()
+    message = operator_signature_message(
+        timestamp, nonce, request.method, _request_target(request), body
+    )
+    expected = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    presented = signature.encode("utf-8")
+    wanted = f"{OPERATOR_SIGNATURE_VERSION}={expected}".encode("ascii")
+    if not hmac.compare_digest(wanted, presented):
+        raise HTTPException(status_code=401, detail="Invalid operator signature")
+
+    # Same single-use store as verify-patch. The two forms cannot collide: they
+    # are HMACs of different messages. timestamp + tolerance still covers every
+    # later `now` that would accept this signature.
+    fresh = storage.remember_patch_signature(expected, float(stamp + tolerance), now)
+    if not fresh:
+        raise HTTPException(status_code=409, detail="Replayed request")
+
+
+class OperatorRoute(APIRoute):
+    """A route that checks the operator signature before anything else.
+
+    The check runs ahead of FastAPI's own body parsing and validation, so an
+    unauthenticated caller gets 401 or 503 whatever it sends, never a 422
+    that describes the expected payload.
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def authenticated(request: Request):
+            await require_operator_signature(request)
+            return await handler(request)
+
+        return authenticated
+
+
+# Every route on this router is authenticated. Add operator routes here, not on `app`.
+operator_router = APIRouter(route_class=OperatorRoute)
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +441,13 @@ async def receive_webhook(
     Only processes 'escrow.disputed' events. All others are acknowledged
     but ignored.
     """
+    if not settings.webhook_secret and not _unauthenticated_allowed():
+        logger.warning("webhook refused because MEDIATOR_WEBHOOK_SECRET is empty")
+        raise HTTPException(
+            status_code=503,
+            detail="webhook requires MEDIATOR_WEBHOOK_SECRET",
+        )
+
     body = await request.body()
 
     # Verify signature
@@ -303,14 +486,14 @@ async def receive_webhook(
     }
 
 
-@app.get("/audits")
+@operator_router.get("/audits")
 def list_audits(limit: int = 20, offset: int = 0):
     """List recent mediation audit records."""
     records, total = storage.list_audit_records(limit, offset)
     return {"audits": records, "total": total}
 
 
-@app.get("/audits/{escrow_id}")
+@operator_router.get("/audits/{escrow_id}")
 def get_audit(escrow_id: str):
     """Get the audit record for a specific escrow."""
     record = storage.get_audit_record(escrow_id)
@@ -330,7 +513,7 @@ class MediationRequest(BaseModel):
     task_type: str | None = None
 
 
-@app.post("/mediate/{escrow_id}")
+@operator_router.post("/mediate/{escrow_id}")
 def trigger_mediation(escrow_id: str, req: MediationRequest | None = None):
     """Manually trigger mediation for a disputed escrow.
 
@@ -367,7 +550,7 @@ class SettlementRequest(BaseModel):
     currency_precision: dict | None = None
 
 
-@app.post("/settle")
+@operator_router.post("/settle")
 def trigger_settlement(req: SettlementRequest):
     """Run the SEC 17a-4 WORM-compliant settlement pipeline.
 
@@ -410,14 +593,14 @@ def trigger_settlement(req: SettlementRequest):
     return result.model_dump(mode="json")
 
 
-@app.get("/settlements")
+@operator_router.get("/settlements")
 def list_settlements(limit: int = 20, offset: int = 0):
     """List recent settlement results."""
     records, total = storage.list_settlement_results(limit, offset)
     return {"settlements": records, "total": total}
 
 
-@app.get("/merkle")
+@operator_router.get("/merkle")
 def merkle_status():
     """Return current Merkle Tree state."""
     tree = get_merkle_tree()
@@ -432,7 +615,7 @@ def merkle_status():
 # ---------------------------------------------------------------------------
 
 
-@app.get("/settlements/pending")
+@operator_router.get("/settlements/pending")
 def list_pending_settlements():
     """Return confirmed settlements whose mandate has not yet been executed.
 
@@ -454,7 +637,7 @@ class ExecutionAck(BaseModel):
     error: str | None = None
 
 
-@app.post("/settlements/ack")
+@operator_router.post("/settlements/ack")
 def ack_execution(ack: ExecutionAck):
     """Mark a confirmed settlement as executed (or failed).
 
@@ -484,7 +667,7 @@ def ack_execution(ack: ExecutionAck):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/heartbeat/status")
+@operator_router.get("/heartbeat/status")
 def heartbeat_status():
     """Return the current state of the heartbeat recovery worker."""
     return _heartbeat.status()
@@ -501,6 +684,9 @@ def list_schemas():
 
     External auditors and peer mediators can use these schemas to
     validate settlement proofs without needing the mediator's source code.
+
+    Deliberately unauthenticated: the response is generated from the model
+    classes in this open-source package and carries no deployment state.
     """
     schemas = export_json_schemas()
     return {
@@ -592,4 +778,5 @@ def _mount_receipt_routes() -> None:
     app.include_router(receipts_router)
 
 
+app.include_router(operator_router)
 _mount_receipt_routes()

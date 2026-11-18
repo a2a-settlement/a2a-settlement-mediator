@@ -103,8 +103,12 @@ class MediatorSettings:
     webhook_port: int = _get_int("MEDIATOR_PORT", 3100)
     # The webhook secret assigned by the exchange when the mediator registers its webhook.
     webhook_secret: str = os.getenv("MEDIATOR_WEBHOOK_SECRET", "")
-    # Verify-patch rejects timestamps farther than this many seconds from now.
+    # Verify-patch and the operator routes reject timestamps farther than this
+    # many seconds from now.
     signature_tolerance_seconds: int = _get_int("MEDIATOR_SIGNATURE_TOLERANCE_S", 300)
+    # Local development only. With no webhook secret, /webhook and the operator
+    # routes refuse every request unless this is on. Ignored when a secret is set.
+    allow_unauthenticated: bool = _get_bool("MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED", False)
     # Public base URL clients use to reach this mediator, e.g. behind a path-prefix proxy.
     # Empty means advertise relative paths.
     public_url: str = os.getenv("MEDIATOR_PUBLIC_URL", "").rstrip("/")

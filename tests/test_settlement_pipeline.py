@@ -670,11 +670,17 @@ class TestArbitrationLLM:
 
 class TestSettlementEndpoints:
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         from fastapi.testclient import TestClient
 
+        from a2a_settlement_mediator.config import settings
         from a2a_settlement_mediator.webhook_listener import app
 
+        # These tests exercise route behaviour, not authentication, so they run
+        # with no secret and the development opt-out on. tests/test_operator_route_auth.py
+        # covers the signature checks.
+        monkeypatch.setattr(settings, "webhook_secret", "")
+        monkeypatch.setattr(settings, "allow_unauthenticated", True)
         return TestClient(app)
 
     @patch("a2a_settlement_mediator.webhook_listener.settle")
@@ -971,11 +977,17 @@ class TestJSONSchemaExport:
 
 class TestSettlementRecoveryEndpoints:
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         from fastapi.testclient import TestClient
 
+        from a2a_settlement_mediator.config import settings
         from a2a_settlement_mediator.webhook_listener import app
 
+        # These tests exercise route behaviour, not authentication, so they run
+        # with no secret and the development opt-out on. tests/test_operator_route_auth.py
+        # covers the signature checks.
+        monkeypatch.setattr(settings, "webhook_secret", "")
+        monkeypatch.setattr(settings, "allow_unauthenticated", True)
         return TestClient(app)
 
     def test_pending_endpoint(self, client):
