@@ -101,6 +101,7 @@ All settings via environment variables (see `.env.example`):
 | `MEDIATOR_ESCALATION_WEBHOOK_URL` | — | Slack/webhook URL for escalation notices |
 | `MEDIATOR_TSA_URL` | `http://freetsa.org/tsr` | RFC 3161 Time Stamp Authority URL |
 | `MEDIATOR_TSA_TIMEOUT` | `15` | Seconds before TSA hard-fail |
+| `MEDIATOR_INSECURE_ALLOW_PRIVATE_FETCH_ADDRESSES` | `false` | Local development and tests only. Lets provenance source URLs that resolve to loopback, private or link-local addresses be fetched. See [SECURITY.md](SECURITY.md#outbound-requests) |
 
 ## Exchange Setup
 
