@@ -2,8 +2,9 @@
 
 ``POST /api/v1/receipts`` is backend-only. It reuses the verify-patch
 timestamped HMAC: ``X-A2ASE-Timestamp`` and ``X-A2ASE-Signature: sha256=<hex>``
-over ``{timestamp}.{raw body}``, with the same replay cache. The other routes
-are unauthenticated. Every route returns 404 while
+over ``{timestamp}.{raw body}``, with the same replay cache. The key is
+``MEDIATOR_RECEIPTS_SECRET`` when set, otherwise ``MEDIATOR_WEBHOOK_SECRET``.
+The other routes are unauthenticated. Every route returns 404 while
 ``MEDIATOR_RECEIPTS_ENABLED`` is false.
 """
 
@@ -59,7 +60,7 @@ def _authorize(body: bytes, timestamp: str | None, signature: str | None) -> Non
     """Timestamped HMAC over ``{timestamp}.{body}``, rejected on replay."""
     from a2a_settlement_mediator import storage, webhook_listener
 
-    if not settings.webhook_secret:
+    if not webhook_listener._accepted_secrets(webhook_listener.PURPOSE_RECEIPTS):
         raise HTTPException(
             status_code=503,
             detail="receipts require MEDIATOR_WEBHOOK_SECRET",
@@ -86,7 +87,9 @@ def _authorize(body: bytes, timestamp: str | None, signature: str | None) -> Non
             detail="Signature timestamp outside the allowed window",
         )
 
-    signature_hex = webhook_listener._verify_patch_signature(body, timestamp, signature)
+    signature_hex = webhook_listener._verify_patch_signature(
+        body, timestamp, signature, webhook_listener.PURPOSE_RECEIPTS
+    )
     if signature_hex is None:
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
     fresh = storage.remember_patch_signature(signature_hex, float(stamp + tolerance), now)

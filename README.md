@@ -95,9 +95,13 @@ All settings via environment variables (see `.env.example`):
 | `MEDIATOR_LLM_TEMPERATURE` | `none` | `none` sends no temperature (Claude 5.x models reject one). Set a number, e.g. `0.1`, for a model that accepts it |
 | `MEDIATOR_AUTO_RESOLVE_THRESHOLD` | `0.80` | Confidence threshold for auto-resolution |
 | `MEDIATOR_PORT` | `3100` | Webhook listener port |
-| `MEDIATOR_WEBHOOK_SECRET` | — | HMAC secret for exchange webhooks and for signed calls to the operator routes. Required: with it empty those routes answer 503 |
+| `MEDIATOR_WEBHOOK_SECRET` | — | HMAC secret for exchange webhooks (`/webhook`). Also used for the operator routes, `/api/v1/verify-patch` and `POST /api/v1/receipts` unless they have their own secret below. A purpose with no secret at all answers 503 |
+| `MEDIATOR_OPERATOR_SECRET` | — | Optional. HMAC secret for the operator routes. When set, `MEDIATOR_WEBHOOK_SECRET` is no longer accepted on them |
+| `MEDIATOR_VERIFY_PATCH_SECRET` | — | Optional. HMAC secret for `POST /api/v1/verify-patch`. When set, `MEDIATOR_WEBHOOK_SECRET` is no longer accepted there |
+| `MEDIATOR_RECEIPTS_SECRET` | — | Optional. HMAC secret for `POST /api/v1/receipts`. When set, `MEDIATOR_WEBHOOK_SECRET` is no longer accepted there |
+| `MEDIATOR_SECRET_TRANSITION_ACCEPT_FALLBACK` | `false` | Rollout aid. While `true`, a purpose that has its own secret also accepts `MEDIATOR_WEBHOOK_SECRET`. See [SECURITY.md](SECURITY.md#moving-from-one-shared-secret-to-separate-secrets) |
 | `MEDIATOR_SIGNATURE_TOLERANCE_S` | `300` | Seconds a signed request's timestamp may differ from the mediator's clock |
-| `MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED` | `false` | Local development only. With no secret set, lets `/webhook` and the operator routes accept unsigned requests. Ignored when a secret is set |
+| `MEDIATOR_INSECURE_ALLOW_UNAUTHENTICATED` | `false` | Local development only. With no secret set, lets `/webhook` and the operator routes accept unsigned requests. Ignored for a purpose that has a secret, its own or the webhook secret |
 | `MEDIATOR_ESCALATION_WEBHOOK_URL` | — | Slack/webhook URL for escalation notices |
 | `MEDIATOR_TSA_URL` | `http://freetsa.org/tsr` | RFC 3161 Time Stamp Authority URL |
 | `MEDIATOR_TSA_TIMEOUT` | `15` | Seconds before TSA hard-fail |
@@ -155,7 +159,7 @@ client.set_webhook(
 |---|---|
 | `X-A2ASE-Timestamp` | Unix seconds, within `MEDIATOR_SIGNATURE_TOLERANCE_S` of the mediator's clock |
 | `X-A2ASE-Nonce` | 16-128 characters from `A-Z a-z 0-9 _ -`, new for every request |
-| `X-A2ASE-Signature` | `v2=` + hex HMAC-SHA256, keyed with `MEDIATOR_WEBHOOK_SECRET` |
+| `X-A2ASE-Signature` | `v2=` + hex HMAC-SHA256, keyed with `MEDIATOR_OPERATOR_SECRET`, or with `MEDIATOR_WEBHOOK_SECRET` when that is not set |
 
 The signed message is `v2`, the timestamp, the nonce, the upper-case method and the request target, each followed by a newline, then the raw body. The target is the path as sent (percent-encoded) plus `?query` when there is a query string.
 
@@ -178,7 +182,7 @@ target = "/audits?limit=5"
 resp = httpx.get(f"http://127.0.0.1:3100{target}", headers=signed_headers(SECRET, "GET", target))
 ```
 
-Responses: 401 for a missing, malformed, stale or wrong signature, 409 when a signature is presented a second time, 503 when the mediator has no `MEDIATOR_WEBHOOK_SECRET`. Sign each attempt afresh; a retry that reuses the headers is rejected as a replay.
+Responses: 401 for a missing, malformed, stale or wrong signature, 409 when a signature is presented a second time, 503 when the mediator has neither `MEDIATOR_OPERATOR_SECRET` nor `MEDIATOR_WEBHOOK_SECRET`. Sign each attempt afresh; a retry that reuses the headers is rejected as a replay.
 
 ## Decision Framework
 
