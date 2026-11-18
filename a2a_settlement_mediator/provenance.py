@@ -18,6 +18,13 @@ from urllib.parse import urlparse
 
 import httpx
 
+from a2a_settlement_mediator.outbound import (
+    ALLOWED_METHODS,
+    OutboundFetchError,
+    OutboundRequestBlocked,
+    OutboundResponseTooLarge,
+    guarded_fetch,
+)
 from a2a_settlement_mediator.schemas import ProvenanceResult
 
 logger = logging.getLogger(__name__)
@@ -236,26 +243,38 @@ class ProvenanceVerifier:
                 flags.append(f"invalid_uri:{uri[:80]}")
                 continue
 
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    if method == "GET":
-                        resp = await client.get(uri)
-                    else:
-                        resp = await client.request(method, uri)
+            if method not in ALLOWED_METHODS:
+                # The method is chosen by the party that wrote the provenance.
+                # Only read-only requests are sent on its behalf.
+                flags.append(f"endpoint_blocked:{uri[:80]}")
+                continue
 
-                    if resp.status_code in (401, 403):
-                        # Reachable but auth-gated, so nothing was fetched or hashed.
-                        # Tier 3 promises an unauthenticated check; auth-gated sources
-                        # belong in tier 2 (signed).
-                        flags.append(f"endpoint_auth_required:{uri[:80]}")
-                    elif resp.status_code >= 400:
-                        flags.append(f"endpoint_error:{uri[:80]}:status={resp.status_code}")
-                    else:
-                        content_hash = ref.get("content_hash")
-                        if content_hash:
-                            actual_hash = self._compute_hash(resp.content)
-                            if actual_hash != content_hash:
-                                flags.append(f"hash_mismatch:{uri[:80]}")
+            content_hash = ref.get("content_hash")
+            try:
+                # The URI is party-supplied: guarded_fetch refuses non-public
+                # targets and validates every redirect hop. The body is only
+                # needed when there is a hash to compare it with.
+                resp = await guarded_fetch(
+                    method, uri, timeout=10.0, read_body=bool(content_hash)
+                )
+
+                if resp.status_code in (401, 403):
+                    # Reachable but auth-gated, so nothing was fetched or hashed.
+                    # Tier 3 promises an unauthenticated check; auth-gated sources
+                    # belong in tier 2 (signed).
+                    flags.append(f"endpoint_auth_required:{uri[:80]}")
+                elif resp.status_code >= 400:
+                    flags.append(f"endpoint_error:{uri[:80]}:status={resp.status_code}")
+                elif content_hash:
+                    actual_hash = self._compute_hash(resp.content)
+                    if actual_hash != content_hash:
+                        flags.append(f"hash_mismatch:{uri[:80]}")
+            except OutboundRequestBlocked:
+                flags.append(f"endpoint_blocked:{uri[:80]}")
+            except OutboundResponseTooLarge:
+                flags.append(f"endpoint_response_too_large:{uri[:80]}")
+            except OutboundFetchError:
+                flags.append(f"endpoint_unreachable:{uri[:80]}")
             except httpx.HTTPError:
                 flags.append(f"endpoint_unreachable:{uri[:80]}")
             except Exception:
@@ -273,6 +292,8 @@ class ProvenanceVerifier:
             if f.startswith("hash_mismatch")
             or f.startswith("endpoint_error")
             or f.startswith("endpoint_unreachable")
+            or f.startswith("endpoint_blocked")
+            or f.startswith("endpoint_response_too_large")
         )
 
         if critical_count > 0:
@@ -468,8 +489,7 @@ class ProvenanceVerifier:
     @staticmethod
     async def _check_endpoint_reachable(uri: str) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.head(uri)
-                return resp.status_code < 500
+            resp = await guarded_fetch("HEAD", uri, timeout=5.0, read_body=False)
+            return resp.status_code < 500
         except Exception:
             return False
