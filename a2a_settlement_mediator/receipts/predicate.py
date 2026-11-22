@@ -43,6 +43,8 @@ INCONCLUSIVE_REASONS = frozenset(
         "infra_error",
         "failure_class_not_exercised",
         "tamper_detected",
+        "model_output_limit",
+        "no_valid_claim",
     }
 )
 _REPO_PATTERN = r"^[^/\s]+/[^/\s]+$"
